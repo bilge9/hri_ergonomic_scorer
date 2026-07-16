@@ -2,7 +2,8 @@ import rclpy
 from rclpy.node import Node
 import numpy as np
 import math
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from .reba import RebaScore
 
 # will confirm the exact import path after the ROSbag files
 from hri_msgs.msg import Skeleton3D, Skeleton3DList
@@ -22,7 +23,7 @@ def calculate_angle(p1, p2, p3):
     mag_v = math.sqrt(vx**2 + vy**2 + vz**2)
     
     if mag_u == 0 or mag_v == 0:
-        return 0.0
+        return None
         
     cos_theta = dot_product / (mag_u * mag_v)
     cos_theta = max(-1.0, min(1.0, cos_theta))
@@ -30,16 +31,30 @@ def calculate_angle(p1, p2, p3):
     angle_rad = math.acos(cos_theta)
     return math.degrees(angle_rad)
 
+def is_valid(pt):
+    if math.isnan(pt[0]) or math.isnan(pt[1]) or math.isnan(pt[2]):
+        return False
+    
+    if pt[0] == 0.0 and pt[1] == 0.0 and pt[2] == 0.0:
+        return False
+    
+    return True
+
 class ErgonomicScorerNode(Node):
     def __init__(self):
         super().__init__('ergonomic_scorer_node')
 
-        # Subscriber to 3D skeleton data.
+        bag_qos_profile = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+
         self.subscription = self.create_subscription(
             Skeleton3DList,
             '/humans/bodies/skel3D',
             self.skeleton_callback,
-            qos_profile_sensor_data
+            bag_qos_profile
         )
 
         # REBA risk threshold parameter.
@@ -70,38 +85,124 @@ class ErgonomicScorerNode(Node):
         # TODO: Implement ID tracking (msg.key) for multi-human scenarios
         target_human = human_list[0]
 
-        # Initialize the 16x3 matrix for reba.py
-        pose_matrix = np.zeros((16, 3))
-
-        # Prevent log spam when the camera loses tracking (all zeros)
-        # Standard ROS4HRI indices -> 1: Neck, 8: Mid-Hip
-        if target_human.skeleton[1].x == 0.0 and target_human.skeleton[8].x == 0.0:
-            return  
+        # Initialize the 18x3 matrix
+        pose_matrix = np.zeros((18, 3))
+        valid_joints_count = 0
 
         # Populate the matrix, handling missing (NaN) data
-        for i in range(16):
-            if math.isnan(target_human.skeleton[i].x):
-                pose_matrix[i] = [0.0, 0.0, 0.0]
+        num_joints = min(len(target_human.skeleton),18)
+        for i in range(num_joints):
+            pt = [target_human.skeleton[i].x, target_human.skeleton[i].y, target_human.skeleton[i].z]
+            if is_valid(pt):
+                pose_matrix[i] = pt
+                valid_joints_count += 1
             else:
-                pose_matrix[i] = [
-                    target_human.skeleton[i].x, 
-                    target_human.skeleton[i].y, 
-                    target_human.skeleton[i].z
-                ]
+                pose_matrix[i] = [0.0, 0.0, 0.0]
 
-        neck_pt = pose_matrix[1]
-        hip_pt = pose_matrix[8]
+        completeness_score = (valid_joints_count / 18.0) * 100
         
-        # Create a virtual vertical reference point (Z-axis up)
-        vertical_ref_pt = [hip_pt[0], hip_pt[1], hip_pt[2] + 1.0]
+        if valid_joints_count == 0:
+            return
+
+        nose = pose_matrix[0]
+        neck = pose_matrix[1]
         
-        # Calculate trunk flexion/extension angle
-        trunk_angle = calculate_angle(neck_pt, hip_pt, vertical_ref_pt)
+        r_sho, r_elb, r_wri = pose_matrix[2], pose_matrix[3], pose_matrix[4]
+        l_sho, l_elb, l_wri = pose_matrix[5], pose_matrix[6], pose_matrix[7]
         
-        self.get_logger().info(f"Real-time Data - Trunk Flexion Angle: {trunk_angle:.2f} degrees")
+        r_hip, r_knee, r_ank = pose_matrix[8], pose_matrix[9], pose_matrix[10]
+        l_hip, l_knee, l_ank = pose_matrix[11], pose_matrix[12], pose_matrix[13]
+
+        trunk_angle, neck_angle = None, None
+        r_knee_angle, l_knee_angle = None, None
+        r_upper_arm_angle, l_upper_arm_angle = None, None
+        r_lower_arm_angle, l_lower_arm_angle = None, None
+
+        mid_hip = [
+            (r_hip[0] + l_hip[0]) / 2.0,
+            (r_hip[1] + l_hip[1]) / 2.0,
+            (r_hip[2] + l_hip[2]) / 2.0
+        ]
+        
+        # 1. Trunk Flexion
+        if is_valid(neck) and is_valid(r_hip) and is_valid(l_hip):
+            mid_hip = [(r_hip[0] + l_hip[0]) / 2.0, (r_hip[1] + l_hip[1]) / 2.0, (r_hip[2] + l_hip[2]) / 2.0]
+            vertical_ref_pt = [mid_hip[0], mid_hip[1], mid_hip[2] + 1.0]
+            trunk_angle = calculate_angle(neck, mid_hip, vertical_ref_pt)
+        
+        # 2. Neck Flexion
+        if is_valid(nose) and is_valid(neck):
+            neck_vertical_ref = [neck[0], neck[1], neck[2] + 1.0]
+            neck_angle = calculate_angle(nose, neck, neck_vertical_ref)
+
+        # 3. Knees
+        if is_valid(r_hip) and is_valid(r_knee) and is_valid(r_ank):
+            r_knee_angle = calculate_angle(r_hip, r_knee, r_ank)
+        if is_valid(l_hip) and is_valid(l_knee) and is_valid(l_ank):
+            l_knee_angle = calculate_angle(l_hip, l_knee, l_ank)
+
+        # 4. Upper Arms
+        if is_valid(r_sho) and is_valid(r_elb):
+            r_hip_ref = [r_sho[0], r_sho[1], r_sho[2] - 1.0] 
+            r_upper_arm_angle = calculate_angle(r_elb, r_sho, r_hip_ref)
+        if is_valid(l_sho) and is_valid(l_elb):
+            l_hip_ref = [l_sho[0], l_sho[1], l_sho[2] - 1.0]
+            l_upper_arm_angle = calculate_angle(l_elb, l_sho, l_hip_ref)
+
+        # 5. Lower Arms
+        if is_valid(r_sho) and is_valid(r_elb) and is_valid(r_wri):
+            r_lower_arm_angle = calculate_angle(r_sho, r_elb, r_wri)
+        if is_valid(l_sho) and is_valid(l_elb) and is_valid(l_wri):
+            l_lower_arm_angle = calculate_angle(l_sho, l_elb, l_wri)
+
+        def fmt(angle): return f"{angle:.1f}°" if angle is not None else "Unknown"
+
+        def fmt(angle): return f"{angle:.1f}°" if angle is not None else "Unknown"
+
+        # Vulcanexus (COCO-18) Uzuv İsimleri
+        joint_names = [
+            "Nose", "Neck", "R_Shoulder", "R_Elbow", "R_Wrist",
+            "L_Shoulder", "L_Elbow", "L_Wrist", "R_Hip", "R_Knee",
+            "R_Ankle", "L_Hip", "L_Knee", "L_Ankle", "R_Eye", "L_Eye",
+            "R_Ear", "L_Ear"
+        ]
+
+        # 18 Uzvun ham X, Y, Z verilerini string olarak birleştir
+        raw_dump = ""
+        for i in range(18):
+            pt = pose_matrix[i]
+            if is_valid(pt):
+                raw_dump += f"  {joint_names[i]:<12}: [X: {pt[0]:.2f}, Y: {pt[1]:.2f}, Z: {pt[2]:.2f}]\n"
+            else:
+                raw_dump += f"  {joint_names[i]:<12}: MISSING\n"
+
+        # Hem Ham Verileri hem de REBA açılarını tek bir dev log ekranında fırlat
+        self.get_logger().info(
+            f"\n==========================================================\n"
+            f"--- RAW JOINT COORDINATES (Vulcanexus COCO-18) ---\n"
+            f"{raw_dump}"
+            f"--- FULL BODY ERGONOMIC REPORT (Completeness: {completeness_score:.0f}%) ---\n"
+            f"[Group A] Trunk: {fmt(trunk_angle)} | Neck: {fmt(neck_angle)}\n"
+            f"          R. Knee: {fmt(r_knee_angle)} | L. Knee: {fmt(l_knee_angle)}\n"
+            f"[Group B] R. Upper Arm: {fmt(r_upper_arm_angle)} | L. Upper Arm: {fmt(l_upper_arm_angle)}\n"
+            f"          R. Lower Arm: {fmt(r_lower_arm_angle)} | L. Lower Arm: {fmt(l_lower_arm_angle)}\n"
+            f"=========================================================="
+        )
 
         try:
-            pass # TODO: Connect REBA algorithm here
+            reba = RebaScore()
+            body_params = reba.get_body_angles_from_pose_right(pose_matrix) 
+            arms_params = reba.get_arms_angles_from_pose_left(pose_matrix) 
+
+            reba.set_body(body_params)
+            score_a, _ = reba.compute_score_a()
+
+            reba.set_arms(arms_params)
+            score_b, _ = reba.compute_score_b()
+
+            final_score, risk_level = reba.compute_score_c(score_a, score_b)
+
+            self.get_logger().info(f"REBA FINAL RISK: {final_score} - {risk_level}")
         except Exception as e:
             self.get_logger().error(f"REBA calculation error: {e}")
 
