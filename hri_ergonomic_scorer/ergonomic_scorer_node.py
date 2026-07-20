@@ -3,53 +3,72 @@ from rclpy.node import Node
 import numpy as np
 import math
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+
+from hri_msgs.msg import Skeleton3DList, RebaAssessment, RebaAssessmentList
+
 from .reba import RebaScore
+from .pose_remap import remap_pose_to_reba, reba_inputs_are_sufficient
 
-# will confirm the exact import path after the ROSbag files
-from hri_msgs.msg import Skeleton3D, Skeleton3DList
+TOTAL_JOINTS = 18
 
-# Import the original rs9000 REBA algorithm we migrated into our package.
-from .reba import RebaScore
+JOINT_NAMES = [
+    "Nose", "Neck", "R_Shoulder", "R_Elbow", "R_Wrist",
+    "L_Shoulder", "L_Elbow", "L_Wrist", "R_Hip", "R_Knee",
+    "R_Ankle", "L_Hip", "L_Knee", "L_Ankle", "R_Eye", "L_Eye",
+    "R_Ear", "L_Ear"
+]
 
-def calculate_angle(p1, p2, p3):
-    """
-    Calculates the angle in degrees between three points. p2 is the vertex. Format: [x, y, z]
-    """
-    ux, uy, uz = p1[0] - p2[0], p1[1] - p2[1], p1[2] - p2[2]
-    vx, vy, vz = p3[0] - p2[0], p3[1] - p2[1], p3[2] - p2[2]
-    
-    dot_product = ux*vx + uy*vy + uz*vz
-    mag_u = math.sqrt(ux**2 + uy**2 + uz**2)
-    mag_v = math.sqrt(vx**2 + vy**2 + vz**2)
-    
-    if mag_u == 0 or mag_v == 0:
-        return None
-        
-    cos_theta = dot_product / (mag_u * mag_v)
-    cos_theta = max(-1.0, min(1.0, cos_theta))
-    
-    angle_rad = math.acos(cos_theta)
-    return math.degrees(angle_rad)
+BODY_ANGLE_NAMES = [
+    "Neck Angle",
+    "Neck Side Bend",
+    "Trunk Angle",
+    "Trunk Side Bend",
+    "Walking",
+    "Leg Angle",
+    "Load"
+]
+
+ARM_ANGLE_NAMES = [
+    "Upper Arm Angle",
+    "Shoulder Raised",
+    "Arm Abducted",
+    "Leaning",
+    "Lower Arm Angle",
+    "Wrist Angle",
+    "Wrist Twisted"
+]
+
+RISK_NAMES = {
+    0: "Negligible Risk",
+    1: "Low Risk. Change may be needed",
+    2: "Medium Risk. Further Investigate. Change Soon",
+    3: "High Risk. Investigate and Implement Change",
+    4: "Very High Risk. Implement Change",
+}
 
 def is_valid(pt):
-    if math.isnan(pt[0]) or math.isnan(pt[1]) or math.isnan(pt[2]):
+    """
+    Check if the given 3D point is valid.
+    Returns False if any coordinate is NaN or if all coordinates are exactly zero.
+    """
+    if any(math.isnan(v) for v in pt):
         return False
-    
-    if pt[0] == 0.0 and pt[1] == 0.0 and pt[2] == 0.0:
+    if all(abs(v) < 1e-6 for v in pt):
         return False
-    
     return True
 
 class ErgonomicScorerNode(Node):
     def __init__(self):
         super().__init__('ergonomic_scorer_node')
 
+        # Define QoS profile suitable for reliable sensor data transmission
         bag_qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
 
+        # Subscriber for incoming 3D skeleton data
         self.subscription = self.create_subscription(
             Skeleton3DList,
             '/humans/bodies/skel3D',
@@ -57,173 +76,299 @@ class ErgonomicScorerNode(Node):
             bag_qos_profile
         )
 
-        # REBA risk threshold parameter.
+        # Publisher for the calculated REBA ergonomic assessments
+        self.reba_pub = self.create_publisher(
+            RebaAssessmentList,
+            '/humans/bodies/ergonomics/reba',
+            bag_qos_profile
+        )
+
+        # Node parameters for risk thresholds and logging verbosity 
         self.declare_parameter('high_risk_threshold', 8)
+        self.threshold = self.get_parameter('high_risk_threshold').get_parameter_value().integer_value
+        
+        self.declare_parameter('verbose_logging', True)
+        self.verbose = self.get_parameter('verbose_logging').get_parameter_value().bool_value
 
-        threshold = self.get_parameter('high_risk_threshold').get_parameter_value().integer_value
-        self.get_logger().info(f"Parameter changed. Threshold: {threshold}")
-
+        self.get_logger().info(f"Parameter changed. Threshold: {self.threshold}")
         self.get_logger().info("Ergonomic Scorer Node started. Waiting for 3D Skeleton data...")
 
     def skeleton_callback(self, msg):
         """
-        Parses the incoming Skeleton3DList message and constructs the 
-        REBA pose matrix for the first detected human with valid data.
+        Callback triggered whenever new skeleton data is received.
+        Filters valid bodies and triggers the REBA assessment process.
         """
-        # Extract the list of skeletons from the message
-        human_list = getattr(msg, 'skeletons', None)
+        active_bodies = []
         
-        # Fallback in case the message structure directly provides a list
-        if human_list is None:
-            human_list = msg if isinstance(msg, list) else [msg]
-
-        # Ignore empty frames
-        if not human_list or len(human_list) == 0:
+        # Filter skeletons that have at least one valid joint
+        for i, s in enumerate(getattr(msg, 'skeletons', [])):
+            has_valid_data = False
+            for pt_obj in s.skeleton:
+                pt = [pt_obj.x, pt_obj.y, pt_obj.z]
+                if is_valid(pt):
+                    has_valid_data = True
+                    break
+            
+            if has_valid_data:
+                # Assign a temporary ID if the tracking system did not provide one
+                if not s.key or s.key.strip() == "":
+                    s.key = f"human_untracked_{i}"
+                active_bodies.append(s)
+        
+        if not active_bodies:
             return
 
-        # Target the first detected human in the frame
-        # TODO: Implement ID tracking (msg.key) for multi-human scenarios
-        target_human = human_list[0]
+        out_list = RebaAssessmentList()
+        out_list.header = msg.header
 
-        # Initialize the 18x3 matrix
-        pose_matrix = np.zeros((18, 3))
+        out_index = 0
+        for body in active_bodies:
+            # Enforce the IDL limit of a maximum of 10 tracked bodies
+            if out_index >= 10:
+                break
+            assessment = self._assess_body(body)
+            if assessment is not None:
+                # Overwrite the pre-allocated slots instead of using append()
+                out_list.assessments[out_index] = assessment
+                out_index += 1
+        # Publish the array if at least one assessment was successfully generated
+        if out_index > 0:
+            self.reba_pub.publish(out_list)
+
+    def _assess_body(self, body):
+        """
+        Core logic to convert raw 3D coordinates into a structured REBA assessment.
+        Handles coordinate normalization, side-selection, and message population.
+        """
+        pose_matrix = np.zeros((TOTAL_JOINTS, 3))
+        valid_mask = np.zeros(TOTAL_JOINTS, dtype=bool)
         valid_joints_count = 0
-
-        # Populate the matrix, handling missing (NaN) data
-        num_joints = min(len(target_human.skeleton),18)
+        # Extract joints into a NumPy array for easier mathematical operations
+        num_joints = min(len(body.skeleton), TOTAL_JOINTS)
         for i in range(num_joints):
-            pt = [target_human.skeleton[i].x, target_human.skeleton[i].y, target_human.skeleton[i].z]
+            pt = [body.skeleton[i].x, body.skeleton[i].y, body.skeleton[i].z]
             if is_valid(pt):
                 pose_matrix[i] = pt
+                valid_mask[i] = True
                 valid_joints_count += 1
-            else:
-                pose_matrix[i] = [0.0, 0.0, 0.0]
 
-        completeness_score = (valid_joints_count / 18.0) * 100
-        
+        completeness = valid_joints_count / float(TOTAL_JOINTS)
         if valid_joints_count == 0:
-            return
+            return None
 
-        nose = pose_matrix[0]
-        neck = pose_matrix[1]
+        reba_pose, reba_valid = remap_pose_to_reba(pose_matrix, valid_mask)
         
-        r_sho, r_elb, r_wri = pose_matrix[2], pose_matrix[3], pose_matrix[4]
-        l_sho, l_elb, l_wri = pose_matrix[5], pose_matrix[6], pose_matrix[7]
+        # Compensate for camera tilt: Ensure the skeleton is vertically aligned
+        # by treating the shoulder line as the horizontal reference.
+        shoulder_center_y = (pose_matrix[2, 1] + pose_matrix[5, 1]) / 2
+        pose_matrix[:, 1] -= shoulder_center_y
         
-        r_hip, r_knee, r_ank = pose_matrix[8], pose_matrix[9], pose_matrix[10]
-        l_hip, l_knee, l_ank = pose_matrix[11], pose_matrix[12], pose_matrix[13]
+        reba_pose, reba_valid = remap_pose_to_reba(pose_matrix, valid_mask)
+        readiness = reba_inputs_are_sufficient(reba_valid)
 
-        trunk_angle, neck_angle = None, None
-        r_knee_angle, l_knee_angle = None, None
-        r_upper_arm_angle, l_upper_arm_angle = None, None
-        r_lower_arm_angle, l_lower_arm_angle = None, None
+        group_a_valid = readiness["body_group_ok"]
+        group_b_valid = readiness["left_arm_ok"] or readiness["right_arm_ok"]
 
-        mid_hip = [
-            (r_hip[0] + l_hip[0]) / 2.0,
-            (r_hip[1] + l_hip[1]) / 2.0,
-            (r_hip[2] + l_hip[2]) / 2.0
-        ]
-        
-        # 1. Trunk Flexion
-        if is_valid(neck) and is_valid(r_hip) and is_valid(l_hip):
-            mid_hip = [(r_hip[0] + l_hip[0]) / 2.0, (r_hip[1] + l_hip[1]) / 2.0, (r_hip[2] + l_hip[2]) / 2.0]
-            vertical_ref_pt = [mid_hip[0], mid_hip[1], mid_hip[2] + 1.0]
-            trunk_angle = calculate_angle(neck, mid_hip, vertical_ref_pt)
-        
-        # 2. Neck Flexion
-        if is_valid(nose) and is_valid(neck):
-            neck_vertical_ref = [neck[0], neck[1], neck[2] + 1.0]
-            neck_angle = calculate_angle(nose, neck, neck_vertical_ref)
-
-        # 3. Knees
-        if is_valid(r_hip) and is_valid(r_knee) and is_valid(r_ank):
-            r_knee_angle = calculate_angle(r_hip, r_knee, r_ank)
-        if is_valid(l_hip) and is_valid(l_knee) and is_valid(l_ank):
-            l_knee_angle = calculate_angle(l_hip, l_knee, l_ank)
-
-        # 4. Upper Arms
-        if is_valid(r_sho) and is_valid(r_elb):
-            r_hip_ref = [r_sho[0], r_sho[1], r_sho[2] - 1.0] 
-            r_upper_arm_angle = calculate_angle(r_elb, r_sho, r_hip_ref)
-        if is_valid(l_sho) and is_valid(l_elb):
-            l_hip_ref = [l_sho[0], l_sho[1], l_sho[2] - 1.0]
-            l_upper_arm_angle = calculate_angle(l_elb, l_sho, l_hip_ref)
-
-        # 5. Lower Arms
-        if is_valid(r_sho) and is_valid(r_elb) and is_valid(r_wri):
-            r_lower_arm_angle = calculate_angle(r_sho, r_elb, r_wri)
-        if is_valid(l_sho) and is_valid(l_elb) and is_valid(l_wri):
-            l_lower_arm_angle = calculate_angle(l_sho, l_elb, l_wri)
-
-        def fmt(angle): return f"{angle:.1f}°" if angle is not None else "Unknown"
-
-        def fmt(angle): return f"{angle:.1f}°" if angle is not None else "Unknown"
-
-        # Vulcanexus (COCO-18) Uzuv İsimleri
-        joint_names = [
-            "Nose", "Neck", "R_Shoulder", "R_Elbow", "R_Wrist",
-            "L_Shoulder", "L_Elbow", "L_Wrist", "R_Hip", "R_Knee",
-            "R_Ankle", "L_Hip", "L_Knee", "L_Ankle", "R_Eye", "L_Eye",
-            "R_Ear", "L_Ear"
-        ]
-
-        # 18 Uzvun ham X, Y, Z verilerini string olarak birleştir
-        raw_dump = ""
-        for i in range(18):
-            pt = pose_matrix[i]
-            if is_valid(pt):
-                raw_dump += f"  {joint_names[i]:<12}: [X: {pt[0]:.2f}, Y: {pt[1]:.2f}, Z: {pt[2]:.2f}]\n"
-            else:
-                raw_dump += f"  {joint_names[i]:<12}: MISSING\n"
-
-        # Hem Ham Verileri hem de REBA açılarını tek bir dev log ekranında fırlat
-        self.get_logger().info(
-            f"\n==========================================================\n"
-            f"--- RAW JOINT COORDINATES (Vulcanexus COCO-18) ---\n"
-            f"{raw_dump}"
-            f"--- FULL BODY ERGONOMIC REPORT (Completeness: {completeness_score:.0f}%) ---\n"
-            f"[Group A] Trunk: {fmt(trunk_angle)} | Neck: {fmt(neck_angle)}\n"
-            f"          R. Knee: {fmt(r_knee_angle)} | L. Knee: {fmt(l_knee_angle)}\n"
-            f"[Group B] R. Upper Arm: {fmt(r_upper_arm_angle)} | L. Upper Arm: {fmt(l_upper_arm_angle)}\n"
-            f"          R. Lower Arm: {fmt(r_lower_arm_angle)} | L. Lower Arm: {fmt(l_lower_arm_angle)}\n"
-            f"=========================================================="
-        )
+        # Initialize the custom ROS 2 message
+        assessment = RebaAssessment()
+        assessment.key = body.key
+        assessment.completeness = float(completeness)
+        assessment.group_a_valid = bool(group_a_valid)
+        assessment.group_b_valid = bool(group_b_valid)
 
         try:
             reba = RebaScore()
-            body_params = reba.get_body_angles_from_pose_right(pose_matrix) 
-            arms_params = reba.get_arms_angles_from_pose_left(pose_matrix) 
+            score_a = score_b = 0
+            
+            # Dictionaries to store calculated angles for terminal output
+            final_body_angles = {}
+            final_arm_angles = {}
 
-            reba.set_body(body_params)
-            score_a, _ = reba.compute_score_a()
+            if group_a_valid:
+                # Calculate body scores for both right and left sides
+                angles_r = reba.get_body_angles_from_pose_right(reba_pose)
+                reba.set_body(angles_r)
+                score_a_r, _ = reba.compute_score_a()
+                
+                angles_l = reba.get_body_angles_from_pose_left(reba_pose)
+                reba.set_body(angles_l)
+                score_a_l, _ = reba.compute_score_a()
+                
+                # Digitize values to prevent NumPy type mismatch errors in ROS 2
+                s_r_val = float(np.max(np.array(score_a_r)))
+                s_l_val = float(np.max(np.array(score_a_l)))
 
-            reba.set_arms(arms_params)
-            score_b, _ = reba.compute_score_b()
+                # Select the side representing the highest risk
+                if s_r_val >= s_l_val:
+                    score_a = int(s_r_val)
+                    final_body_angles = angles_r
+                else:
+                    score_a = int(s_l_val)
+                    final_body_angles = angles_l
 
-            final_score, risk_level = reba.compute_score_c(score_a, score_b)
+                assessment.score_a = score_a
 
-            self.get_logger().info(f"REBA FINAL RISK: {final_score} - {risk_level}")
+            if group_b_valid:
+                candidates = []
+                arm_angles_r = arm_angles_l = {}
+                
+                if readiness["right_arm_ok"]:
+                    arm_angles_r = reba.get_arms_angles_from_pose_right(reba_pose)
+                    reba.set_arms(arm_angles_r)
+                    s_r, _ = reba.compute_score_b()
+                    candidates.append((float(np.max(np.array(s_r))), arm_angles_r))
+                    
+                if readiness["left_arm_ok"]:
+                    arm_angles_l = reba.get_arms_angles_from_pose_left(reba_pose)
+                    reba.set_arms(arm_angles_l)
+                    s_l, _ = reba.compute_score_b()
+                    candidates.append((float(np.max(np.array(s_l))), arm_angles_l))
+                
+                if len(candidates) > 0:
+                    # Select the arm with the highest risk score
+                    best_candidate = max(candidates, key=lambda item: item[0])
+                    score_b = int(best_candidate[0])
+                    assessment.score_b = score_b
+                    final_arm_angles = best_candidate[1]
+
+            if group_a_valid and group_b_valid:
+                score_c, risk_lvl = reba.compute_score_c(score_a, score_b)
+                # Both body and arms are valid; calculate the grand final Score C
+                assessment.score_c = int(score_c)
+                
+                # Map Score C to IDL 'uint8' risk levels (0-4)
+                if score_c <= 1: risk_num = 0
+                elif score_c <= 3: risk_num = 1
+                elif score_c <= 7: risk_num = 2
+                elif score_c <= 10: risk_num = 3
+                else: risk_num = 4
+                
+                assessment.risk_level = risk_num
+
+                body_side = "Right" if score_a_r >= score_a_l else "Left"
+
+                if readiness["right_arm_ok"] and readiness["left_arm_ok"]:
+                    arm_side = "Right" if score_b == int(float(np.max(np.array(s_r)))) else "Left"
+                elif readiness["right_arm_ok"]:
+                    arm_side = "Right"
+                else:
+                    arm_side = "Left"
+
+                self._print_reba_breakdown(
+                    key=body.key,
+                    score_a=score_a,
+                    score_b=score_b,
+                    score_c=score_c,
+                    risk_lvl=risk_lvl,
+                    completeness=completeness,
+                    valid_joints=valid_joints_count,
+                    body_side=body_side,
+                    arm_side=arm_side,
+                    body_angles=final_body_angles,
+                    arm_angles=final_arm_angles
+                )
+                    
+            else:
+                self.get_logger().info(f"[{body.key}] Incomplete skeleton! Assessment skipped. Group A Valid: {group_a_valid}, Group B Valid: {group_b_valid}")
+
         except Exception as e:
-            self.get_logger().error(f"REBA calculation error: {e}")
+            self.get_logger().error(f"[{body.key}] REBA calculation error: {e}")
+
+        # Dump raw coordinates to terminal if verbose logging is enabled
+        if self.verbose:
+            self._print_raw_dump(body.key, pose_matrix, completeness)
+
+        return assessment
+
+    def _print_reba_breakdown(
+        self,
+        key,
+        score_a,
+        score_b,
+        score_c,
+        risk_lvl,
+        completeness,
+        valid_joints,
+        body_side,
+        arm_side,
+        body_angles,
+        arm_angles
+    ):
+        """
+        Prints a highly formatted, readable dashboard for REBA assessments.
+        """
+        text = f"\n"
+        text += f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+        text += f"┃ REBA ASSESSMENT DASHBOARD                                      ┃\n"
+        text += f"┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n"
+        text += f"┃ Target ID : {key:<50} ┃\n"
+        text += f"┃ Completeness: {completeness*100:3.0f}% ({valid_joints}/18 joints)                          ┃\n"
+        text += f"┃ Final Score : {score_c:<2}  =>  {risk_lvl:<36} ┃\n"
+        text += f"┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n"
+        text += f"┃ [GROUP A: BODY] Evaluated Side: {body_side:<30} ┃\n"
+        text += f"┠────────────────────────────────────────────────────────────────┨\n"
+
+        if isinstance(body_angles, np.ndarray):
+            for name, value in zip(BODY_ANGLE_NAMES, body_angles):
+                val = float(value)
+                text += f"┃   {name:<24}: {val:7.2f}°                           ┃\n"
+        elif isinstance(body_angles, dict):
+            for k, v in body_angles.items():
+                if "angle" in k.lower():
+                    val = float(v)
+                    text += f"┃   {k:<24}: {val:7.2f}°                           ┃\n"
+                else:
+                    text += f"┃   {k:<24}: {v:<33} ┃\n"
+
+        text += f"┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n"
+        text += f"┃ [GROUP B: ARM ] Evaluated Side: {arm_side:<30} ┃\n"
+        text += f"┠────────────────────────────────────────────────────────────────┨\n"
+
+        if isinstance(arm_angles, np.ndarray):
+            for name, value in zip(ARM_ANGLE_NAMES, arm_angles):
+                val = float(value)
+                text += f"┃   {name:<24}: {val:7.2f}°                           ┃\n"
+        elif isinstance(arm_angles, dict):
+            for k, v in arm_angles.items():
+                if "angle" in k.lower():
+                    val = float(v)
+                    text += f"┃   {k:<24}: {val:7.2f}°                           ┃\n"
+                else:
+                    text += f"┃   {k:<24}: {v:<33} ┃\n"
+
+        text += f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+        self.get_logger().info(text)
+
+    def _print_raw_dump(self, key, pose_matrix, completeness):
+        """
+        Prints the raw X, Y, Z joint coordinates for debugging.
+        """
+        raw_dump = ""
+        for i in range(TOTAL_JOINTS):
+            pt = pose_matrix[i]
+            if is_valid(pt):
+                raw_dump += f"  {JOINT_NAMES[i]:<12}: [X: {pt[0]:5.2f}, Y: {pt[1]:5.2f}, Z: {pt[2]:5.2f}]\n"
+            else:
+                raw_dump += f"  {JOINT_NAMES[i]:<12}: MISSING\n"
+
+        self.get_logger().info(
+            f"\n--- RAW JOINT COORDINATES (Vulcanexus COCO-18) ---\n"
+            f"Target ID : {key}\n"
+            f"Data Ratio: {completeness*100:.0f}%\n"
+            f"--------------------------------------------------\n"
+            f"{raw_dump}"
+            f"--------------------------------------------------"
+        )
 
 def main(args=None):
-
     rclpy.init(args=args)
-
-    # Create the ergnomic scorer node
     node = ErgonomicScorerNode()
-
     try:
-        # Keep the node running.
         rclpy.spin(node)
-
     except KeyboardInterrupt:
         print("\n[INFO] Node stopped by user.")
-    
     finally:
-
         node.destroy_node()
-    
         try:
             rclpy.shutdown()
         except Exception:

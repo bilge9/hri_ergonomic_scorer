@@ -347,6 +347,9 @@ class RebaScore:
             title = "Leg angle: " + str(round(legs_angle, 2)) + " Step size: " + str(round(step_size, 2))
             utils.show_skeleton(pose, title=title)
 
+        neck_angle = normalize_angle(neck_angle)
+        trunk_angle = normalize_angle(trunk_angle)
+        legs_angle = normalize_angle(legs_angle)
         return np.array([neck_angle, neck_side, trunk_angle, trunk_side,
                            legs_walking, legs_angle, load])
 
@@ -418,7 +421,10 @@ class RebaScore:
         if verbose:
             title = "Leg angle: " + str(round(legs_angle, 2)) + " Step size: " + str(round(step_size, 2))
             utils.show_skeleton(pose, title=title)
-
+        
+        neck_angle = normalize_angle(neck_angle)
+        trunk_angle = normalize_angle(trunk_angle)
+        legs_angle = normalize_angle(legs_angle)
         return np.array([neck_angle, neck_side, trunk_angle, trunk_side,
                 legs_walking, legs_angle, load])
 
@@ -511,6 +517,10 @@ class RebaScore:
             pose, _ = utils.rotate_pose(pose, rotation_joint=8, m_coeff=-np.pi / 2)
             wrist_twisted_angle = abs(np.rad2deg(np.arctan2(pose[0, 14, 1], pose[0, 14, 0]) - (np.pi / 2)))
             wrist_twisted = 1 if wrist_twisted_angle > 30 else 0
+        
+        upper_arm_angle = normalize_angle(upper_arm_angle)
+        lower_arm_angle = normalize_angle(lower_arm_angle)
+        wrist_angle = normalize_angle(wrist_angle)
 
         return np.array([upper_arm_angle, shoulder_raised, arm_abducted, leaning,
                 lower_arm_angle, wrist_angle, wrist_twisted])
@@ -587,9 +597,17 @@ class RebaScore:
             wrist_twisted_angle = abs(np.rad2deg((np.pi / 2) + np.arctan2(pose[0, 15, 1], pose[0, 15, 0])))
             wrist_twisted = 1 if wrist_twisted_angle > 30 else 0
 
-
+        upper_arm_angle = normalize_angle(upper_arm_angle)
+        lower_arm_angle = normalize_angle(lower_arm_angle)
+        wrist_angle = normalize_angle(wrist_angle)
         return np.array([upper_arm_angle, shoulder_raised, arm_abducted, leaning,
                          lower_arm_angle, wrist_angle, wrist_twisted])
+
+def normalize_angle(angle):
+    """
+    Normalize angle to [-180, 180] degrees.
+    """
+    return ((angle + 180) % 360) - 180
 
 def quad(coord):
     q = 0
