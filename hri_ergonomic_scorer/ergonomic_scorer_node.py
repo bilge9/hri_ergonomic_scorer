@@ -4,7 +4,8 @@ import numpy as np
 import math
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
-from hri_msgs.msg import Skeleton3DList, RebaAssessment, RebaAssessmentList
+from hri_msgs.msg import Skeleton3DList
+from hri_ergonomic_msgs.msg import RebaAssessment, RebaAssessmentList
 
 from .reba import RebaScore
 from .pose_remap import remap_pose_to_reba, reba_inputs_are_sufficient
@@ -216,20 +217,23 @@ class ErgonomicScorerNode(Node):
                     arm_angles_r = reba.get_arms_angles_from_pose_right(reba_pose)
                     reba.set_arms(arm_angles_r)
                     s_r, _ = reba.compute_score_b()
-                    candidates.append((float(np.max(np.array(s_r))), arm_angles_r))
+
+                    candidates.append((float(np.max(np.array(s_r))), abs(arm_angles_r[0]), arm_angles_r, "Right", s_r))
                     
                 if readiness["left_arm_ok"]:
                     arm_angles_l = reba.get_arms_angles_from_pose_left(reba_pose)
                     reba.set_arms(arm_angles_l)
                     s_l, _ = reba.compute_score_b()
-                    candidates.append((float(np.max(np.array(s_l))), arm_angles_l))
+                    candidates.append((float(np.max(np.array(s_l))), abs(arm_angles_l[0]), arm_angles_l, "Left", s_l))
                 
                 if len(candidates) > 0:
-                    # Select the arm with the highest risk score
-                    best_candidate = max(candidates, key=lambda item: item[0])
+                    best_candidate = max(candidates, key=lambda item: (item[0], item[1]))
                     score_b = int(best_candidate[0])
                     assessment.score_b = score_b
-                    final_arm_angles = best_candidate[1]
+                    final_arm_angles = best_candidate[2]
+                    
+                    calculated_arm_side = best_candidate[3]
+                    winning_s_r = best_candidate[4]
 
             if group_a_valid and group_b_valid:
                 score_c, risk_lvl = reba.compute_score_c(score_a, score_b)
@@ -246,13 +250,8 @@ class ErgonomicScorerNode(Node):
                 assessment.risk_level = risk_num
 
                 body_side = "Right" if score_a_r >= score_a_l else "Left"
-
-                if readiness["right_arm_ok"] and readiness["left_arm_ok"]:
-                    arm_side = "Right" if score_b == int(float(np.max(np.array(s_r)))) else "Left"
-                elif readiness["right_arm_ok"]:
-                    arm_side = "Right"
-                else:
-                    arm_side = "Left"
+                
+                arm_side = calculated_arm_side
 
                 self._print_reba_breakdown(
                     key=body.key,
