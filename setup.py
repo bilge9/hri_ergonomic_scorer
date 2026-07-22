@@ -24,7 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'scorer_node = hri_ergonomic_scorer.ergonomic_scorer_node:main'
+            'scorer_node = hri_ergonomic_scorer.ergonomic_scorer_node:main',
+            'fiware_reba_bridge = hri_ergonomic_scorer.fiware_reba_bridge:main'
         ],
     },
 )
