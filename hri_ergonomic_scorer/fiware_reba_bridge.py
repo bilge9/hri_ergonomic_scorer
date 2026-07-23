@@ -75,14 +75,45 @@ class FiwareRebaBridgeNode(Node):
                 "type": "Property",
                 "value": bool(assessment.group_b_valid),
                 "observedAt": timestamp
+            },
+            # --- Per-region REBA breakdown (Group A: body) ---
+            "neckScore": {
+                "type": "Property",
+                "value": int(assessment.neck_score),
+                "observedAt": timestamp
+            },
+            "trunkScore": {
+                "type": "Property",
+                "value": int(assessment.trunk_score),
+                "observedAt": timestamp
+            },
+            "legScore": {
+                "type": "Property",
+                "value": int(assessment.leg_score),
+                "observedAt": timestamp
+            },
+            # --- Per-region REBA breakdown (Group B: arm) ---
+            "upperArmScore": {
+                "type": "Property",
+                "value": int(assessment.upper_arm_score),
+                "observedAt": timestamp
+            },
+            "lowerArmScore": {
+                "type": "Property",
+                "value": int(assessment.lower_arm_score),
+                "observedAt": timestamp
+            },
+            "wristScore": {
+                "type": "Property",
+                "value": int(assessment.wrist_score),
+                "observedAt": timestamp
             }
         }
 
         patch_url = f"{ORION_LD_URL}/{entity_id}/attrs"
 
         try:
-            # Update only the modified attributes using a PATCH request
-            response = requests.patch(
+            response = requests.post(
                 patch_url,
                 data=json.dumps(patch_payload),
                 headers=HEADERS
@@ -103,6 +134,9 @@ class FiwareRebaBridgeNode(Node):
                 )
 
                 self.get_logger().info(f"Created new entity: {entity_id}")
+                
+            elif response.status_code not in [200, 201, 204]:
+                self.get_logger().warn(f"Orion response: {response.status_code} - {response.text}")
 
         except requests.exceptions.RequestException as e:
             self.get_logger().error(f"Orion-LD connection error: {e}")

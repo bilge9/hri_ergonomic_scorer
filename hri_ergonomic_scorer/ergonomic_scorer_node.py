@@ -49,8 +49,8 @@ RISK_NAMES = {
 
 def is_valid(pt):
     """
-    Check if the given 3D point is valid.
-    Returns False if any coordinate is NaN or if all coordinates are exactly zero.
+    Check if 3D point is valid.
+    Returns False if NaN or exactly zero.
     """
     if any(math.isnan(v) for v in pt):
         return False
@@ -62,14 +62,14 @@ class ErgonomicScorerNode(Node):
     def __init__(self):
         super().__init__('ergonomic_scorer_node')
 
-        # Define QoS profile suitable for reliable sensor data transmission
+        # QoS profile for reliable data transmission
         bag_qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
 
-        # Subscriber for incoming 3D skeleton data
+        # Subscriber for 3D skeleton data
         self.subscription = self.create_subscription(
             Skeleton3DList,
             '/humans/bodies/skel3D',
@@ -77,14 +77,14 @@ class ErgonomicScorerNode(Node):
             bag_qos_profile
         )
 
-        # Publisher for the calculated REBA ergonomic assessments
+        # Publisher for REBA assessments
         self.reba_pub = self.create_publisher(
             RebaAssessmentList,
             '/humans/bodies/ergonomics/reba',
             bag_qos_profile
         )
 
-        # Node parameters for risk thresholds and logging verbosity 
+        # Node parameters
         self.declare_parameter('high_risk_threshold', 8)
         self.threshold = self.get_parameter('high_risk_threshold').get_parameter_value().integer_value
         
@@ -96,12 +96,11 @@ class ErgonomicScorerNode(Node):
 
     def skeleton_callback(self, msg):
         """
-        Callback triggered whenever new skeleton data is received.
-        Filters valid bodies and triggers the REBA assessment process.
+        Process incoming skeleton data and trigger REBA assessment.
         """
         active_bodies = []
         
-        # Filter skeletons that have at least one valid joint
+        # Filter skeletons with valid joints
         for i, s in enumerate(getattr(msg, 'skeletons', [])):
             has_valid_data = False
             for pt_obj in s.skeleton:
@@ -111,7 +110,7 @@ class ErgonomicScorerNode(Node):
                     break
             
             if has_valid_data:
-                # Assign a temporary ID if the tracking system did not provide one
+                # Assign temporary ID if missing
                 if not s.key or s.key.strip() == "":
                     s.key = f"human_untracked_{i}"
                 active_bodies.append(s)
@@ -124,27 +123,28 @@ class ErgonomicScorerNode(Node):
 
         out_index = 0
         for body in active_bodies:
-            # Enforce the IDL limit of a maximum of 10 tracked bodies
+            # Max 10 tracked bodies
             if out_index >= 10:
                 break
             assessment = self._assess_body(body)
             if assessment is not None:
-                # Overwrite the pre-allocated slots instead of using append()
+                # Overwrite pre-allocated slots
                 out_list.assessments[out_index] = assessment
                 out_index += 1
-        # Publish the array if at least one assessment was successfully generated
+                
+        # Publish if assessment generated
         if out_index > 0:
             self.reba_pub.publish(out_list)
 
     def _assess_body(self, body):
         """
-        Core logic to convert raw 3D coordinates into a structured REBA assessment.
-        Handles coordinate normalization, side-selection, and message population.
+        Convert 3D coordinates into a REBA assessment.
         """
         pose_matrix = np.zeros((TOTAL_JOINTS, 3))
         valid_mask = np.zeros(TOTAL_JOINTS, dtype=bool)
         valid_joints_count = 0
-        # Extract joints into a NumPy array for easier mathematical operations
+        
+        # Extract joints to NumPy array
         num_joints = min(len(body.skeleton), TOTAL_JOINTS)
         for i in range(num_joints):
             pt = [body.skeleton[i].x, body.skeleton[i].y, body.skeleton[i].z]
@@ -153,24 +153,48 @@ class ErgonomicScorerNode(Node):
                 valid_mask[i] = True
                 valid_joints_count += 1
 
+        # --- DEPTH OCCLUSION FILTER ---
+        # COCO-18 Indices: R_Shoulder=2, L_Shoulder=5
+        # ZED camera optical frame: +Z is forward (away from camera).
+        if valid_mask[2] and valid_mask[5]:
+            # Calculate depth (Z) difference between shoulders
+            z_diff = pose_matrix[2, 2] - pose_matrix[5, 2]
+            
+            # If depth difference > 15cm, assume profile stance
+            PROFILE_THRESHOLD = 0.15 
+            
+            if abs(z_diff) > PROFILE_THRESHOLD:
+                # Hide the side that is further away
+                if z_diff > 0:
+                    # Right side is occluded
+                    hidden_joints = [2, 3, 4, 8, 9, 10]
+                    side_name = "Right"
+                else:
+                    # Left side is occluded
+                    hidden_joints = [5, 6, 7, 11, 12, 13]
+                    side_name = "Left"
+                    
+                # Remove hallucinated occluded joints
+                for hj in hidden_joints:
+                    if valid_mask[hj]:
+                        valid_mask[hj] = False
+                        valid_joints_count -= 1
+                
+                if self.verbose:
+                    self.get_logger().info(f"[{body.key}] Profile pose detected! Filtered hallucinated {side_name} side joints. Running partial REBA.")
+        # ---------------------------------------------------
+
         completeness = valid_joints_count / float(TOTAL_JOINTS)
         if valid_joints_count == 0:
             return None
 
-        reba_pose, reba_valid = remap_pose_to_reba(pose_matrix, valid_mask)
-        
-        # Compensate for camera tilt: Ensure the skeleton is vertically aligned
-        # by treating the shoulder line as the horizontal reference.
-        shoulder_center_y = (pose_matrix[2, 1] + pose_matrix[5, 1]) / 2
-        pose_matrix[:, 1] -= shoulder_center_y
-        
         reba_pose, reba_valid = remap_pose_to_reba(pose_matrix, valid_mask)
         readiness = reba_inputs_are_sufficient(reba_valid)
 
         group_a_valid = readiness["body_group_ok"]
         group_b_valid = readiness["left_arm_ok"] or readiness["right_arm_ok"]
 
-        # Initialize the custom ROS 2 message
+        # Initialize ROS 2 message
         assessment = RebaAssessment()
         assessment.key = body.key
         assessment.completeness = float(completeness)
@@ -181,33 +205,37 @@ class ErgonomicScorerNode(Node):
             reba = RebaScore()
             score_a = score_b = 0
             
-            # Dictionaries to store calculated angles for terminal output
             final_body_angles = {}
             final_arm_angles = {}
 
             if group_a_valid:
-                # Calculate body scores for both right and left sides
+                # Calculate body scores
                 angles_r = reba.get_body_angles_from_pose_right(reba_pose)
-                reba.set_body(angles_r)
-                score_a_r, _ = reba.compute_score_a()
-                
+                reba.set_body(np.abs(angles_r))
+                score_a_r, partial_a_r = reba.compute_score_a()
+
                 angles_l = reba.get_body_angles_from_pose_left(reba_pose)
-                reba.set_body(angles_l)
-                score_a_l, _ = reba.compute_score_a()
+                reba.set_body(np.abs(angles_l))
+                score_a_l, partial_a_l = reba.compute_score_a()
                 
-                # Digitize values to prevent NumPy type mismatch errors in ROS 2
+                # Prevent NumPy type mismatch errors
                 s_r_val = float(np.max(np.array(score_a_r)))
                 s_l_val = float(np.max(np.array(score_a_l)))
 
-                # Select the side representing the highest risk
+                # Select highest risk side
                 if s_r_val >= s_l_val:
                     score_a = int(s_r_val)
                     final_body_angles = angles_r
+                    final_body_partial = partial_a_r
                 else:
                     score_a = int(s_l_val)
                     final_body_angles = angles_l
+                    final_body_partial = partial_a_l
 
                 assessment.score_a = score_a
+                assessment.neck_score = int(final_body_partial[0])
+                assessment.trunk_score = int(final_body_partial[1])
+                assessment.leg_score = int(final_body_partial[2])
 
             if group_b_valid:
                 candidates = []
@@ -216,15 +244,15 @@ class ErgonomicScorerNode(Node):
                 if readiness["right_arm_ok"]:
                     arm_angles_r = reba.get_arms_angles_from_pose_right(reba_pose)
                     reba.set_arms(arm_angles_r)
-                    s_r, _ = reba.compute_score_b()
+                    s_r, partial_b_r = reba.compute_score_b()
 
-                    candidates.append((float(np.max(np.array(s_r))), abs(arm_angles_r[0]), arm_angles_r, "Right", s_r))
+                    candidates.append((float(np.max(np.array(s_r))), abs(arm_angles_r[0]), arm_angles_r, "Right", s_r, partial_b_r))
                     
                 if readiness["left_arm_ok"]:
                     arm_angles_l = reba.get_arms_angles_from_pose_left(reba_pose)
-                    reba.set_arms(arm_angles_l)
-                    s_l, _ = reba.compute_score_b()
-                    candidates.append((float(np.max(np.array(s_l))), abs(arm_angles_l[0]), arm_angles_l, "Left", s_l))
+                    reba.set_arms(np.abs(arm_angles_l))
+                    s_l, partial_b_l = reba.compute_score_b()
+                    candidates.append((float(np.max(np.array(s_l))), abs(arm_angles_l[0]), arm_angles_l, "Left", s_l, partial_b_l))
                 
                 if len(candidates) > 0:
                     best_candidate = max(candidates, key=lambda item: (item[0], item[1]))
@@ -234,13 +262,17 @@ class ErgonomicScorerNode(Node):
                     
                     calculated_arm_side = best_candidate[3]
                     winning_s_r = best_candidate[4]
+                    final_arm_partial = best_candidate[5]
+
+                    assessment.upper_arm_score = int(final_arm_partial[0])
+                    assessment.lower_arm_score = int(final_arm_partial[1])
+                    assessment.wrist_score = int(final_arm_partial[2])
 
             if group_a_valid and group_b_valid:
                 score_c, risk_lvl = reba.compute_score_c(score_a, score_b)
-                # Both body and arms are valid; calculate the grand final Score C
                 assessment.score_c = int(score_c)
                 
-                # Map Score C to IDL 'uint8' risk levels (0-4)
+                # Map Score C to risk levels (0-4)
                 if score_c <= 1: risk_num = 0
                 elif score_c <= 3: risk_num = 1
                 elif score_c <= 7: risk_num = 2
@@ -250,7 +282,6 @@ class ErgonomicScorerNode(Node):
                 assessment.risk_level = risk_num
 
                 body_side = "Right" if score_a_r >= score_a_l else "Left"
-                
                 arm_side = calculated_arm_side
 
                 self._print_reba_breakdown(
@@ -273,7 +304,7 @@ class ErgonomicScorerNode(Node):
         except Exception as e:
             self.get_logger().error(f"[{body.key}] REBA calculation error: {e}")
 
-        # Dump raw coordinates to terminal if verbose logging is enabled
+        # Print raw coordinates
         if self.verbose:
             self._print_raw_dump(body.key, pose_matrix, completeness)
 
@@ -294,7 +325,7 @@ class ErgonomicScorerNode(Node):
         arm_angles
     ):
         """
-        Prints a highly formatted, readable dashboard for REBA assessments.
+        Print REBA assessment dashboard.
         """
         text = f"\n"
         text += f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
@@ -340,7 +371,7 @@ class ErgonomicScorerNode(Node):
 
     def _print_raw_dump(self, key, pose_matrix, completeness):
         """
-        Prints the raw X, Y, Z joint coordinates for debugging.
+        Print raw X, Y, Z joint coordinates.
         """
         raw_dump = ""
         for i in range(TOTAL_JOINTS):
