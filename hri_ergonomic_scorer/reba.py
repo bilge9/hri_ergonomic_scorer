@@ -280,6 +280,23 @@ class RebaScore:
 
         pose = np.expand_dims(np.copy(pose), 0)
 
+        # --- FIX: Vektörel Gövde (Trunk) ve Boyun (Neck) Açıları ---
+        # 2D rotasyonlar iskeleti bozmadan önce, orijinal 3D verilerden gerçek açıları alıyoruz.
+        mid_hip_3d = (pose[0, 8] + pose[0, 11]) / 2.0
+        trunk_vec_3d = pose[0, 1] - mid_hip_3d
+        vertical_up = np.array([0.0, 1.0, 0.0])
+        
+        # Gövde Açısı
+        cos_trunk = np.dot(trunk_vec_3d, vertical_up) / (np.linalg.norm(trunk_vec_3d) + 1e-9)
+        cos_trunk = np.clip(cos_trunk, -1.0, 1.0)
+        true_trunk_angle = np.degrees(np.arccos(cos_trunk))
+
+        # Boyun Açısı
+        neck_vec_3d = pose[0, 0] - pose[0, 1]
+        cos_neck = np.dot(trunk_vec_3d, neck_vec_3d) / (np.linalg.norm(trunk_vec_3d) * np.linalg.norm(neck_vec_3d) + 1e-9)
+        cos_neck = np.clip(cos_neck, -1.0, 1.0)
+        true_neck_angle = np.degrees(np.arccos(cos_neck))
+
         neck_angle, neck_side, trunk_angle, trunk_side, \
         legs_walking, legs_angle, load = 0, 0, 0, 0, 0, 0, 0
 
@@ -292,10 +309,8 @@ class RebaScore:
         pose, _ = utils.rotate_pose(pose, rotation_joint=8)
         pose -= (pose[:, 8] + pose[:, 11]) /2
 
-        if quad(pose[0, 1]) < 3:
-            trunk_angle = np.rad2deg(np.arctan2(pose[0, 1, 1], pose[0, 1, 0]) - (np.pi / 2))
-        else:
-            trunk_angle = 270 + np.rad2deg(np.arctan2(pose[0, 1, 1], pose[0, 1, 0]))
+        # Eski karmaşık arctan2 hesapları yerine 3D açıyı doğrudan atıyoruz
+        trunk_angle = true_trunk_angle
 
         if verbose:
             utils.show_skeleton(pose, title="Trunk angle: " + str(round(trunk_angle, 2)))
@@ -314,10 +329,8 @@ class RebaScore:
         pose, _ = utils.rotate_pose(pose, rotation_joint=8, m_coeff=-np.pi/2)
         pose -= pose[:, 1]
 
-        if quad(pose[0, 0]) < 3:
-            neck_angle = np.rad2deg(np.arctan2(pose[0, 0, 1], pose[0, 0, 0]) - (np.pi / 2)) - trunk_angle
-        else:
-            neck_angle = 270 + np.rad2deg(np.arctan2(pose[0, 0, 1], pose[0, 0, 0])) - trunk_angle
+        # Eski karmaşık hesaplar yerine vektörel açıyı kullanıyoruz
+        neck_angle = true_neck_angle
 
         if verbose:
             utils.show_skeleton(pose, title="Neck angle: " + str(round(neck_angle, 2)))
@@ -335,10 +348,13 @@ class RebaScore:
         pose, _ = utils.rotate_pose(pose, rotation_joint=8, m_coeff=-np.pi / 2)
         pose -= pose[:, 8]
 
-        if quad(pose[0, 9]) > 2:
-            legs_angle = -np.rad2deg(np.arctan2(pose[0, 9, 1], pose[0, 9, 0]) + (np.pi/2))
-        else:
-            legs_angle = 270 - np.rad2deg(np.arctan2(pose[0, 9, 1], pose[0, 9, 0]))
+        # --- FIX: Vektörel Bacak Bükülmesi (Flexion) ---
+        v_thigh = pose[0, 9] - pose[0, 8]   # Hip to Knee
+        v_shin = pose[0, 10] - pose[0, 9]   # Knee to Ankle
+        cos_leg = np.dot(v_thigh, v_shin) / (np.linalg.norm(v_thigh) * np.linalg.norm(v_shin) + 1e-9)
+        cos_leg = np.clip(cos_leg, -1.0, 1.0)
+        # Doğrudan bükülme miktarını (flexion) hesaplıyoruz (0 = düz bacak, 40° = bükülü)
+        legs_angle = np.degrees(np.arccos(cos_leg))
 
         step_size = abs(np.linalg.norm(pose[0, 10, :2] - pose[0, 13, :2]))
         legs_walking = 1 if step_size > 0.1 else 0
@@ -368,6 +384,22 @@ class RebaScore:
         '''
         pose = np.expand_dims(np.copy(pose), 0)
 
+        # --- FIX: Vektörel Gövde (Trunk) ve Boyun (Neck) Açıları ---
+        mid_hip_3d = (pose[0, 8] + pose[0, 11]) / 2.0
+        trunk_vec_3d = pose[0, 1] - mid_hip_3d
+        vertical_up = np.array([0.0, 1.0, 0.0])
+        
+        # Gövde Açısı
+        cos_trunk = np.dot(trunk_vec_3d, vertical_up) / (np.linalg.norm(trunk_vec_3d) + 1e-9)
+        cos_trunk = np.clip(cos_trunk, -1.0, 1.0)
+        true_trunk_angle = np.degrees(np.arccos(cos_trunk))
+
+        # Boyun Açısı
+        neck_vec_3d = pose[0, 0] - pose[0, 1]
+        cos_neck = np.dot(trunk_vec_3d, neck_vec_3d) / (np.linalg.norm(trunk_vec_3d) * np.linalg.norm(neck_vec_3d) + 1e-9)
+        cos_neck = np.clip(cos_neck, -1.0, 1.0)
+        true_neck_angle = np.degrees(np.arccos(cos_neck))
+
         neck_angle, neck_side, trunk_angle, trunk_side, \
         legs_walking, legs_angle, load = 0, 0, 0, 0, 0, 0, 0
 
@@ -382,7 +414,9 @@ class RebaScore:
         # Trunk position
         pose, _ = utils.rotate_pose(pose, rotation_joint=8, m_coeff=np.pi)
         pose -= (pose[:, 8] + pose[:, 11]) / 2
-        trunk_angle = np.rad2deg((np.pi / 2)  - np.arctan2(pose[0, 1, 1], pose[0, 1, 0]))
+        
+        # Eski karmaşık arctan2 hesapları yerine 3D açıyı doğrudan atıyoruz
+        trunk_angle = true_trunk_angle
 
         if verbose:
             utils.show_skeleton(pose, title="Trunk angle: " + str(round(trunk_angle, 2)))
@@ -398,7 +432,9 @@ class RebaScore:
         # Neck position
         pose, _ = utils.rotate_pose(pose, rotation_joint=8, m_coeff=-np.pi / 2)
         pose -= pose[:, 1]
-        neck_angle = np.rad2deg((np.pi / 2) - np.arctan2(pose[0, 0, 1], pose[0, 0, 0])) - trunk_angle
+        
+        # Eski karmaşık hesaplar yerine vektörel açıyı kullanıyoruz
+        neck_angle = true_neck_angle
 
         if verbose:
             utils.show_skeleton(pose, title="Neck angle: " + str(round(neck_angle, 2)))
@@ -414,7 +450,14 @@ class RebaScore:
         # Legs position
         pose, _ = utils.rotate_pose(pose, rotation_joint=8, m_coeff=-np.pi / 2)
         pose -= pose[:, 11]
-        legs_angle = np.rad2deg((np.pi / 2) + np.arctan2(pose[0, 12, 1], pose[0, 12, 0]))
+
+        # --- FIX: Vektörel Bacak Bükülmesi (Flexion) ---
+        v_thigh = pose[0, 12] - pose[0, 11] # Hip to Knee
+        v_shin = pose[0, 13] - pose[0, 12]  # Knee to Ankle
+        cos_leg = np.dot(v_thigh, v_shin) / (np.linalg.norm(v_thigh) * np.linalg.norm(v_shin) + 1e-9)
+        cos_leg = np.clip(cos_leg, -1.0, 1.0)
+        legs_angle = np.degrees(np.arccos(cos_leg))
+
         step_size = abs(np.linalg.norm(pose[0, 10, :2] - pose[0, 13, :2]))
         legs_walking = 1 if step_size > 0.1 else 0
 
@@ -427,7 +470,7 @@ class RebaScore:
         legs_angle = normalize_angle(legs_angle)
         return np.array([neck_angle, neck_side, trunk_angle, trunk_side,
                 legs_walking, legs_angle, load])
-
+    
     @staticmethod
     def get_arms_angles_from_pose_left(pose, verbose=False):
         # type: (np.ndarray, bool) -> np.ndarray
@@ -441,6 +484,16 @@ class RebaScore:
                               lower_arm_angle, wrist_angle, wrist_twisted)
         '''
         pose = np.expand_dims(np.copy(pose), 0)
+
+        # --- FIX: Vektörel Üst Kol Açısı (Sol Kol) ---
+        arm_vec_3d = pose[0, 3] - pose[0, 2]  # L_Shoulder(2) to L_Elbow(3)
+        vertical_down = np.array([0.0, 1.0, 0.0])
+        
+        cos_upper = np.dot(arm_vec_3d, vertical_down) / (np.linalg.norm(arm_vec_3d) + 1e-9)
+        cos_upper = np.clip(cos_upper, -1.0, 1.0)
+        # 180 dereceye tamamlama simetrisi ile yönü düzeltiyoruz
+        true_upper_arm_angle = 180.0 - np.degrees(np.arccos(cos_upper))
+
         if verbose:
             utils.show_skeleton(pose, title="GT pose")
 
@@ -462,13 +515,8 @@ class RebaScore:
         pose, _ = utils.rotate_pose(pose, rotation_joint=8)
         pose -= pose[:, 2]
 
-        if quad(pose[0, 3]) > 2:
-            upper_arm_angle = -np.rad2deg(np.arctan2(pose[0, 3, 1], pose[0, 3, 0]) + (np.pi / 2))
-        else:
-            upper_arm_angle = 270 - np.rad2deg(np.arctan2(pose[0, 3, 1], pose[0, 3, 0]))
-
-
-        upper_arm_angle += trunk_angle
+        # Eski karmaşık arctan2 hesapları yerine 3D açıyı doğrudan atıyoruz
+        upper_arm_angle = true_upper_arm_angle
 
         if verbose:
             utils.show_skeleton(pose, title="Upper Arms angle: " + str(round(upper_arm_angle, 2)))
@@ -493,12 +541,13 @@ class RebaScore:
         pose, _ = utils.rotate_pose(pose, rotation_joint=8, m_coeff=-np.pi/2)
         pose -= pose[:, 3]
 
-        if quad(pose[0, 4]) > 2:
-            lower_arm_angle = -np.rad2deg(np.arctan2(pose[0, 4, 1], pose[0, 4, 0]) + (np.pi / 2))
-        else:
-            lower_arm_angle = 270 - np.rad2deg(np.arctan2(pose[0, 4, 1], pose[0, 4, 0]))
-
-        lower_arm_angle = lower_arm_angle + trunk_angle - upper_arm_angle
+        # --- FIX: Sol Kol (Left Arm) Vektörel Dirsek Açısı ---
+        v_upper = pose[0, 2] - pose[0, 3]  # L_Shoulder(2) to L_Elbow(3)
+        v_lower = pose[0, 4] - pose[0, 3]  # L_Wrist(4) to L_Elbow(3)
+        
+        cos_theta = np.dot(v_upper, v_lower) / (np.linalg.norm(v_upper) * np.linalg.norm(v_lower) + 1e-9)
+        cos_theta = np.clip(cos_theta, -1.0, 1.0)
+        lower_arm_angle = 180.0 - np.degrees(np.arccos(cos_theta))
 
         if verbose:
             utils.show_skeleton(pose, title="Lower Arms angle: " + str(round(lower_arm_angle, 2)))
@@ -539,6 +588,16 @@ class RebaScore:
                                lower_arm_angle, wrist_angle, wrist_twisted)
         '''
         pose = np.expand_dims(np.copy(pose), 0)
+
+        # --- FIX: Vektörel Üst Kol Açısı (Sağ Kol) ---
+        arm_vec_3d = pose[0, 6] - pose[0, 5]  # R_Shoulder(5) to R_Elbow(6)
+        vertical_down = np.array([0.0, 1.0, 0.0])
+        
+        cos_upper = np.dot(arm_vec_3d, vertical_down) / (np.linalg.norm(arm_vec_3d) + 1e-9)
+        cos_upper = np.clip(cos_upper, -1.0, 1.0)
+        # 180 dereceye tamamlama simetrisi ile yönü düzeltiyoruz
+        true_upper_arm_angle = 180.0 - np.degrees(np.arccos(cos_upper))
+
         if verbose:
             utils.show_skeleton(pose, title="GT pose")
 
@@ -555,10 +614,9 @@ class RebaScore:
 
         # Upper Arm position
         pose -= pose[:, 5]
-        if quad(pose[0, 6]) == 2:
-            upper_arm_angle = -(270 - np.rad2deg(np.arctan2(pose[0, 6, 1], pose[0, 6, 0])) - trunk_angle)
-        else:
-            upper_arm_angle = np.rad2deg((np.pi /2) + np.arctan2(pose[0, 6, 1], pose[0, 6, 0])) + trunk_angle
+        
+        # Eski karmaşık arctan2 hesapları yerine 3D açıyı doğrudan atıyoruz
+        upper_arm_angle = true_upper_arm_angle
 
         if verbose:
             utils.show_skeleton(pose, title="Upper Arms angle: " + str(round(upper_arm_angle, 2)))
@@ -577,7 +635,14 @@ class RebaScore:
         # Lower Arm position
         pose, _ = utils.rotate_pose(pose, rotation_joint=8, m_coeff=-np.pi / 2)
         pose -= pose[:, 6]
-        lower_arm_angle = np.rad2deg((np.pi / 2) + np.arctan2(pose[0, 7, 1], pose[0, 7, 0]) ) + trunk_angle - upper_arm_angle
+
+        # --- FIX: Sağ Kol (Right Arm) Vektörel Dirsek Açısı ---
+        v_upper = pose[0, 5] - pose[0, 6]  # R_Shoulder(5) to R_Elbow(6)
+        v_lower = pose[0, 7] - pose[0, 6]  # R_Wrist(7) to R_Elbow(6)
+
+        cos_theta = np.dot(v_upper, v_lower) / (np.linalg.norm(v_upper) * np.linalg.norm(v_lower) + 1e-9)
+        cos_theta = np.clip(cos_theta, -1.0, 1.0)
+        lower_arm_angle = 180.0 - np.degrees(np.arccos(cos_theta))
 
         if verbose:
             utils.show_skeleton(pose, title="Lower Arms angle: " + str(round(lower_arm_angle, 2)))

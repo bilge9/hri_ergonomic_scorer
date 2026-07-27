@@ -268,11 +268,28 @@ class ErgonomicScorerNode(Node):
                     assessment.lower_arm_score = int(final_arm_partial[1])
                     assessment.wrist_score = int(final_arm_partial[2])
 
-            if group_a_valid and group_b_valid:
+            # Kısmi değerlendirmeye izin ver (VEYA mantığı)
+            if group_a_valid or group_b_valid:
+                
+                # Grup A (Gövde) eksikse, minimum REBA risk puanı olan 1'i ata
+                if not group_a_valid:
+                    score_a = 1
+                    body_side = "Unknown (Occluded)"
+                else:
+                    body_side = "Right" if score_a_r >= score_a_l else "Left"
+
+                # Grup B (Kol) eksikse, minimum REBA risk puanı olan 1'i ata
+                if not group_b_valid:
+                    score_b = 1
+                    arm_side = "Unknown (Occluded)"
+                else:
+                    arm_side = calculated_arm_side
+
+                # Score C artık her halükarda hesaplanabilecek
                 score_c, risk_lvl = reba.compute_score_c(score_a, score_b)
                 assessment.score_c = int(score_c)
                 
-                # Map Score C to risk levels (0-4)
+                # Risk seviyesi eşlemeleri (0-4)
                 if score_c <= 1: risk_num = 0
                 elif score_c <= 3: risk_num = 1
                 elif score_c <= 7: risk_num = 2
@@ -280,9 +297,6 @@ class ErgonomicScorerNode(Node):
                 else: risk_num = 4
                 
                 assessment.risk_level = risk_num
-
-                body_side = "Right" if score_a_r >= score_a_l else "Left"
-                arm_side = calculated_arm_side
 
                 self._print_reba_breakdown(
                     key=body.key,
@@ -294,12 +308,12 @@ class ErgonomicScorerNode(Node):
                     valid_joints=valid_joints_count,
                     body_side=body_side,
                     arm_side=arm_side,
-                    body_angles=final_body_angles,
+                    body_angles=final_body_angles, # Eksik grupta boş dict {} gidecek, yazdırmada sorun çıkarmaz
                     arm_angles=final_arm_angles
                 )
                     
             else:
-                self.get_logger().info(f"[{body.key}] Incomplete skeleton! Assessment skipped. Group A Valid: {group_a_valid}, Group B Valid: {group_b_valid}")
+                self.get_logger().info(f"[{body.key}] No valid groups! Assessment skipped.")
 
         except Exception as e:
             self.get_logger().error(f"[{body.key}] REBA calculation error: {e}")
