@@ -32,8 +32,8 @@ from hri_ergonomic_msgs.msg import RebaAssessmentList
 JOINT_NAMES = [
     "Nose", "Neck", "R_Shoulder", "R_Elbow", "R_Wrist",
     "L_Shoulder", "L_Elbow", "L_Wrist", "R_Hip", "R_Knee",
-    "R_Ankle", "L_Hip", "L_Knee", "L_Ankle", "R_Eye", "L_Eye",
-    "R_Ear", "L_Ear"
+    "R_Ankle", "L_Hip", "L_Knee", "L_Ankle", "L_Eye", "R_Eye",
+    "L_Ear", "R_Ear"
 ]
 
 # Bone connections as (joint_index_a, joint_index_b) pairs

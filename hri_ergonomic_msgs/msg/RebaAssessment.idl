@@ -56,6 +56,16 @@ module hri_ergonomic_msgs {
 
       boolean group_a_valid;
       boolean group_b_valid;
+
+      // Group A (Body) Partial Scores
+      uint8 neck_score;
+      uint8 trunk_score;
+      uint8 leg_score;
+
+      // Group B (Arm) Partial Scores
+      uint8 upper_arm_score;
+      uint8 lower_arm_score;
+      uint8 wrist_score;
     };
 
   };

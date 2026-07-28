@@ -8,12 +8,11 @@ V_R_HIP = 8; V_R_KNE = 9; V_R_ANK = 10
 V_L_HIP = 11; V_L_KNE = 12; V_L_ANK = 13
 
 # rs9000 target index -> Vulcanexus source index
-# (verified against reba.py's actual class docstring + rotate_pose usage,
-# NOT just the README -- see get_body_angles_from_pose_right: uses pose[:,8]/
-# pose[:,11] as hips, pose[:,1] as Neck, pose[:,0] as Head)
 V2R = {
-    0: V_NOSE,   # rs9000 Head        <- Vulcanexus Nose (closest available proxy, no exact "head" joint)
-    1: V_NECK,   # rs9000 Neck        <- Vulcanexus Neck (exact match)
+    # NOTE: Vulcanexus COCO-18 formatında ayrı bir "Head" eklemi olmadığı için, 
+    # baş referansı olarak "Nose" eklemi proxy (vekil) olarak kullanılmıştır.
+    0: V_NOSE,   # rs9000 Head        <- Vulcanexus Nose 
+    1: V_NECK,   # rs9000 Neck        <- Vulcanexus Neck 
     2: V_L_SHO,  # rs9000 L_Shoulder  <- Vulcanexus L_Shoulder
     3: V_L_ELB,  # rs9000 L_Elbow     <- Vulcanexus L_Elbow
     4: V_L_WRI,  # rs9000 L_Wrist     <- Vulcanexus L_Wrist
@@ -28,27 +27,10 @@ V2R = {
     13: V_R_ANK, # rs9000 R_Ankle     <- Vulcanexus R_Ankle
 }
 
-REBA_JOINT_COUNT = 14  # no hand data from Vulcanexus -> exactly 14, not 16
-                        # (reba.py's own `if pose.shape[1] > 14:` guard then
-                        # safely defaults wrist_angle/wrist_twisted to 0
-                        # instead of us feeding it a fake (0,0,0) hand point)
+REBA_JOINT_COUNT = 14  
 
-# Set this to True ONLY as a controlled experiment, one variable at a time,
-# after confirming the joint-index remap alone doesn't fix trunk_angle.
-# Evidence from real bag data (Y already encodes correct top-to-bottom
-# anatomical order: eyes/ears smallest Y, ankles largest Y) suggests this
-# should stay False.
 SWAP_Y_Z = False
-
-# Evidence from real test logs: neck_angle/upper_arm_angle (RELATIVE angles,
-# which internally subtract/add trunk_angle) come out physically sane, while
-# trunk_angle/legs_angle (ABSOLUTE angles measured against reba.py's assumed
-# vertical) sit stuck around +-175-180 deg for an upright person. That's the
-# signature of reba.py assuming +Y = up, while our data has Y increasing
-# downward (optical camera frame). Flipping Y's SIGN (not swapping with Z)
-# should fix this while keeping Y as the correct vertical axis.
 FLIP_Y_SIGN = True
-
 
 def remap_pose_to_reba(pose_matrix: np.ndarray, valid_mask: np.ndarray):
     """
@@ -74,24 +56,39 @@ def remap_pose_to_reba(pose_matrix: np.ndarray, valid_mask: np.ndarray):
         reba_valid[target_idx] = valid_mask[source_idx]
     return reba_pose, reba_valid
 
-
 def reba_inputs_are_sufficient(reba_valid: np.ndarray) -> dict:
     """
-    NOTE: indices here are in REMAPPED rs9000 space (post remap_pose_to_reba),
-    not raw Vulcanexus indices -- 8/11 are hips in rs9000 space.
+    Checks independent readiness of each body part.
+    Indices are in REMAPPED rs9000 space:
+    0: Head, 1: Neck, 2: L_Shoulder, 3: L_Elbow, 4: L_Wrist
+    5: R_Shoulder, 6: R_Elbow, 7: R_Wrist, 8: L_Hip, 9: L_Knee, 10: L_Ankle
+    11: R_Hip, 12: R_Knee, 13: R_Ankle
     """
-    hips_ok = reba_valid[8] and reba_valid[11]
-    trunk_neck_ok = hips_ok and reba_valid[0] and reba_valid[1]
+    mid_hip_ok = reba_valid[8] and reba_valid[11]
+    shoulder_axis_ok = reba_valid[2] and reba_valid[5]
 
-    # Tolerant per your latest change: legs aren't required for body_group_ok,
-    # missing legs just means reba.py's own defaults (0) apply to legs_angle.
-    body_group_ok = trunk_neck_ok
+    trunk_ok = reba_valid[1] and mid_hip_ok
+    neck_ok = reba_valid[0] and reba_valid[1] and mid_hip_ok and shoulder_axis_ok
 
-    left_arm_ok = reba_valid[2] and (reba_valid[3] or reba_valid[4])
-    right_arm_ok = reba_valid[5] and (reba_valid[6] or reba_valid[7])
+    left_leg_ok = reba_valid[8] and reba_valid[9] and reba_valid[10]
+    right_leg_ok = reba_valid[11] and reba_valid[12] and reba_valid[13]
+
+    left_upper_arm_ok = reba_valid[2] and reba_valid[3] and shoulder_axis_ok
+    left_lower_arm_ok = reba_valid[3] and reba_valid[4] and reba_valid[2]
+    
+    right_upper_arm_ok = reba_valid[5] and reba_valid[6] and shoulder_axis_ok
+    right_lower_arm_ok = reba_valid[6] and reba_valid[7] and reba_valid[5]
 
     return {
-        "body_group_ok": body_group_ok,
-        "left_arm_ok": left_arm_ok,
-        "right_arm_ok": right_arm_ok,
+        "trunk_ok": trunk_ok,
+        "neck_ok": neck_ok,
+        "left_leg_ok": left_leg_ok,
+        "right_leg_ok": right_leg_ok,
+        "left_upper_arm_ok": left_upper_arm_ok,
+        "left_lower_arm_ok": left_lower_arm_ok,
+        "right_upper_arm_ok": right_upper_arm_ok,
+        "right_lower_arm_ok": right_lower_arm_ok,
+        "body_group_ok": trunk_ok or neck_ok or left_leg_ok or right_leg_ok,
+        "left_arm_ok": left_upper_arm_ok or left_lower_arm_ok,
+        "right_arm_ok": right_upper_arm_ok or right_lower_arm_ok
     }
