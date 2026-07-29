@@ -29,8 +29,8 @@ V2R = {
 
 REBA_JOINT_COUNT = 14  
 
-SWAP_Y_Z = False
-FLIP_Y_SIGN = True
+SWAP_Y_Z = True
+FLIP_Y_SIGN = False
 
 def remap_pose_to_reba(pose_matrix: np.ndarray, valid_mask: np.ndarray):
     """
@@ -91,4 +91,43 @@ def reba_inputs_are_sufficient(reba_valid: np.ndarray) -> dict:
         "body_group_ok": trunk_ok or neck_ok or left_leg_ok or right_leg_ok,
         "left_arm_ok": left_upper_arm_ok or left_lower_arm_ok,
         "right_arm_ok": right_upper_arm_ok or right_lower_arm_ok
+    }
+
+def remap_scalar_to_reba(scalar_array: np.ndarray) -> np.ndarray:
+    """
+    scalar_array: (18,) per-joint scalar (e.g. confidence), Vulcanexus order.
+    Applies the same V2R index mapping as remap_pose_to_reba, but for a
+    single scalar per joint instead of an (x,y,z) triplet.
+    """
+    reba_scalar = np.zeros(REBA_JOINT_COUNT)
+    for target_idx, source_idx in V2R.items():
+        reba_scalar[target_idx] = scalar_array[source_idx]
+    return reba_scalar
+
+
+def reba_region_confidence(reba_confidence: np.ndarray) -> dict:
+    """
+    Average confidence backing each REBA region's angle computation.
+    NOT a validity check (see reba_inputs_are_sufficient for that) - this is
+    a reliability readout so the dashboard can show "this angle was computed
+    from joints with X% average confidence" next to the angle itself.
+
+    Index legend (REMAPPED rs9000 space):
+    0: Head, 1: Neck, 2: L_Shoulder, 3: L_Elbow, 4: L_Wrist
+    5: R_Shoulder, 6: R_Elbow, 7: R_Wrist, 8: L_Hip, 9: L_Knee, 10: L_Ankle
+    11: R_Hip, 12: R_Knee, 13: R_Ankle
+    """
+    def avg(indices):
+        vals = [reba_confidence[i] for i in indices]
+        return float(np.mean(vals)) if vals else 0.0
+
+    return {
+        "neck_conf": avg([0, 1, 2, 5]),
+        "trunk_conf": avg([1, 8, 11]),
+        "left_leg_conf": avg([8, 9, 10]),
+        "right_leg_conf": avg([11, 12, 13]),
+        "left_upper_arm_conf": avg([2, 3, 5]),
+        "left_lower_arm_conf": avg([2, 3, 4]),
+        "right_upper_arm_conf": avg([5, 6, 2]),
+        "right_lower_arm_conf": avg([5, 6, 7]),
     }

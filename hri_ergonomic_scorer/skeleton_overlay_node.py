@@ -156,16 +156,15 @@ class SkeletonOverlayNode(Node):
         return (u, v)
 
     def canvas_point(self, pt, scale=150):
-        """Fallback: map relative X/Y directly onto a blank canvas (no real camera).
-
-        NOTE: ZED camera Y-axis already points downward (same convention as
-        image/pixel coordinates), same issue solved in reba.py/pose_remap.py
-        via FLIP_Y_SIGN. So we do NOT flip here - flipping would double-invert
-        and render the skeleton upside down.
-        """
+        """Fallback: map relative Y/Z directly onto a blank canvas for base_link frame."""
         h, w = CANVAS_SIZE
-        u = int(w / 2 + pt[0] * scale)
-        v = int(h / 2 + pt[1] * scale)  # no flip: ZED Y is already down-positive
+        
+        # Y ekseni (pt[1]) omuz genişliği/sağ-sol, Z ekseni (pt[2]) ise boy uzunluğudur.
+        # Görüntüde u yatay, v dikey eksendir. 
+        # v ekseni (canvas Y) aşağı doğru büyüdüğü için yüksekliği (pt[2]) eksi ile çarpıyoruz.
+        u = int(w / 2 - pt[1] * scale)
+        v = int(h / 2 - pt[2] * scale)  
+        
         return (u, v)
 
     def skeleton_callback(self, msg):
@@ -182,11 +181,33 @@ class SkeletonOverlayNode(Node):
             frame = np.zeros((*CANVAS_SIZE, 3), dtype=np.uint8)
             project_fn = self.canvas_point
 
+        # Boyun (Neck) eklemini merkez (0,0,0) olarak belirle
+        neck = body.skeleton[1]
+        center_x = neck.x if not np.isnan(neck.x) else 0.0
+        center_y = neck.y if not np.isnan(neck.y) else 0.0
+        center_z = neck.z if not np.isnan(neck.z) else 0.0
+
         points_2d = [None] * len(JOINT_NAMES)
         for i, pt_obj in enumerate(body.skeleton[:len(JOINT_NAMES)]):
             pt = [pt_obj.x, pt_obj.y, pt_obj.z]
             if is_valid(pt):
-                points_2d[i] = project_fn(pt)
+                if self.latest_frame is None or self.camera_matrix is None:
+                    # CANVAS MODE: İskeleti merkeze sabitle ve izometrik (açılı) yansıt
+                    # Vücudu merkezden çıkartarak harita hareketlerinden (savrulmadan) koruyoruz
+                    dx = pt[0] - center_x
+                    dy = pt[1] - center_y
+                    dz = pt[2] - center_z
+                    
+                    h, w = CANVAS_SIZE
+                    scale = 150
+                    
+                    # 3D İzometrik Projeksiyon ile derinlik (X ve Y birleşimi) ve yükseklik (Z)
+                    u = int(w / 2 + (dx - dy) * 0.707 * scale)
+                    v = int(h / 2 - dz * scale + (dx + dy) * 0.35 * scale)
+                    points_2d[i] = (u, v)
+                else:
+                    # OVERLAY MODE: Gerçek kamera varsa orijinal yansıtmayı kullan
+                    points_2d[i] = project_fn(pt)
 
         # Look up this body's latest REBA scores (may be None if not yet computed)
         assessment = self.latest_assessments.get(body.key)

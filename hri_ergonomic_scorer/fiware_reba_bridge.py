@@ -29,15 +29,16 @@ class FiwareRebaBridgeNode(Node):
 
         self.get_logger().info("NGSI-LD & TRoE FIWARE Bridge Started.")
 
-    def get_iso_time(self):
-        """Generate an ISO 8601 UTC timestamp for Grafana compatibility."""
-        return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+    def get_iso_time_from_header(self, header):
+        """Generate an ISO 8601 UTC timestamp from a ROS header for Grafana."""
+        sec = header.stamp.sec
+        nanosec = header.stamp.nanosec
+        dt = datetime.fromtimestamp(sec + nanosec / 1e9, tz=timezone.utc)
+        return dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
-    def send_to_orion_ld(self, assessment):
+    def send_to_orion_ld(self, assessment, timestamp):
         """Send a single valid ergonomic assessment to Orion-LD."""
-
         entity_id = f"urn:ngsi-ld:ErgonomicAssessment:{assessment.key}"
-        timestamp = self.get_iso_time()
 
         # NGSI-LD PATCH payload containing all REBA assessment attributes
         patch_payload = {
@@ -107,7 +108,32 @@ class FiwareRebaBridgeNode(Node):
                 "type": "Property",
                 "value": int(assessment.wrist_score),
                 "observedAt": timestamp
-            }
+            },
+            "neckConfidence": {
+                "type": "Property",
+                "value": float(assessment.body_confidence[0]),
+                "observedAt": timestamp
+            },
+            "trunkConfidence": {
+                "type": "Property",
+                "value": float(assessment.body_confidence[2]),
+                "observedAt": timestamp
+            },
+            "legConfidence": {
+                "type": "Property",
+                "value": float(assessment.body_confidence[4]),
+                "observedAt": timestamp
+            },
+            "upperArmConfidence": {
+                "type": "Property",
+                "value": float(assessment.arm_confidence[0]),
+                "observedAt": timestamp
+            },
+            "lowerArmConfidence": {
+                "type": "Property",
+                "value": float(assessment.arm_confidence[4]),
+                "observedAt": timestamp
+            },
         }
 
         patch_url = f"{ORION_LD_URL}/{entity_id}/attrs"
@@ -142,19 +168,17 @@ class FiwareRebaBridgeNode(Node):
             self.get_logger().error(f"Orion-LD connection error: {e}")
 
     def reba_callback(self, msg):
-        """
-        Process all REBA assessments received in the RebaAssessmentList message.
-        """
+        """Process all REBA assessments received in the RebaAssessmentList message."""
+        
+        # Zaman damgasını rosbag'in kayıtlı ROS mesaj başlığından (header) al
+        timestamp = self.get_iso_time_from_header(msg.header)
 
-        # Iterate through all assessment entries in the message
         for assessment in msg.assessments:
-
-            # Skip unused entries with an empty key
             if not assessment.key:
                 continue
-
-            # Send each valid assessment to Orion-LD
-            self.send_to_orion_ld(assessment)
+            
+            # Doğru zaman damgasını fonksiyona parametre olarak ilet
+            self.send_to_orion_ld(assessment, timestamp)
 
 
 def main(args=None):

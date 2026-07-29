@@ -56,7 +56,9 @@ module hri_ergonomic_msgs {
 
       boolean group_a_valid;
       boolean group_b_valid;
-
+      float body_confidence[7];
+      float arm_confidence[7];
+      
       // Group A (Body) Partial Scores
       uint8 neck_score;
       uint8 trunk_score;
