@@ -9,8 +9,7 @@ V_L_HIP = 11; V_L_KNE = 12; V_L_ANK = 13
 
 # rs9000 target index -> Vulcanexus source index
 V2R = {
-    # NOTE: Vulcanexus COCO-18 formatında ayrı bir "Head" eklemi olmadığı için, 
-    # baş referansı olarak "Nose" eklemi proxy (vekil) olarak kullanılmıştır.
+    # NOTE: Since there is no separate "Head" joint in the Vulcanexus COCO-18 format, the "Nose" joint is used as a proxy reference for the head.
     0: V_NOSE,   # rs9000 Head        <- Vulcanexus Nose 
     1: V_NECK,   # rs9000 Neck        <- Vulcanexus Neck 
     2: V_L_SHO,  # rs9000 L_Shoulder  <- Vulcanexus L_Shoulder

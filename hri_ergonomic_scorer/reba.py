@@ -4,9 +4,9 @@
 import numpy as np
 
 class RebaScore:
-    '''
-    Class to compute REBA metrics
-    '''
+    """
+    Class to compute REBA metrics.
+    """
     def __init__(self):
         self.table_a = np.zeros((3, 5, 4))
         self.table_b = np.zeros((6, 2, 3))
@@ -19,7 +19,8 @@ class RebaScore:
 
         self.arms = {'upper_arm_angle': 0, 'shoulder_raised': False, 'arm_abducted': False, 'leaning': False,
                      'lower_arm_angle': 0,
-                     'wrist_angle': 0, 'wrist_twisted': False}
+                     'wrist_angle': 0, 'wrist_twisted': False,
+                     'coupling_score': 0}
 
         self.init_table_a()
         self.init_table_b()
@@ -71,35 +72,32 @@ class RebaScore:
     def compute_score_a(self):
         neck_score, trunk_score, leg_score, load_score = 0, 0, 0, 0
 
-        # Neck position
-        # NOTE (Deviation from original rs9000 package):
-        # Orijinal paketteki (10 <= neck_angle <= 20) hatası, standart REBA tablosuna 
-        # (0-20 derece arası risk skor 1) tam uyum sağlamak için 0 <= neck_angle <= 20 olarak düzeltildi.
+        # Neck position score calculation
         if 0 <= self.body['neck_angle'] <= 20:
-            neck_score +=1
+            neck_score += 1
         else:
-            neck_score +=2
-        neck_score +=1 if self.body['neck_side'] else 0
+            neck_score += 2
+        neck_score += 1 if self.body['neck_side'] else 0
 
-        # Trunk position
+        # Trunk position score calculation
         if 0 <= self.body['trunk_angle'] <= 1:
-            trunk_score +=1
+            trunk_score += 1
         elif self.body['trunk_angle'] <= 20:
-            trunk_score +=2
+            trunk_score += 2
         elif 20 <= self.body['trunk_angle'] <= 60:
-            trunk_score +=3
+            trunk_score += 3
         elif self.body['trunk_angle'] > 60:
-            trunk_score +=4
+            trunk_score += 4
         trunk_score += 1 if self.body['trunk_side'] else 0
 
-        # Legs position
+        # Legs position score calculation
         leg_score += 2 if self.body['legs_walking'] else 1
         if 30 <= self.body['legs_angle'] <= 60:
             leg_score += 1
         elif self.body['legs_angle'] > 60:
             leg_score += 2
 
-        # Load
+        # Load score calculation
         if 5 <= self.body['load'] <= 10:
             load_score += 1
         elif self.body['load'] > 10:
@@ -107,32 +105,36 @@ class RebaScore:
 
         assert neck_score > 0 and trunk_score > 0 and leg_score > 0
         score_a = self.table_a[neck_score-1][trunk_score-1][leg_score-1]
-        return score_a, np.array([neck_score, trunk_score, leg_score])
+
+        # Add load score to Table A result
+        score_a += load_score
+
+        return score_a, np.array([neck_score, trunk_score, leg_score, load_score])
 
     def compute_score_b(self):
         upper_arm_score, lower_arm_score, wrist_score = 0, 0, 0
 
-        # Upper arm position
+        # Upper arm position score calculation
         if -20 <= self.arms['upper_arm_angle'] <= 20:
-            upper_arm_score +=1
+            upper_arm_score += 1
         elif self.arms['upper_arm_angle'] <= 45:
-            upper_arm_score +=2
+            upper_arm_score += 2
         elif 45 <= self.arms['upper_arm_angle'] <= 90:
-            upper_arm_score +=3
+            upper_arm_score += 3
         elif self.arms['upper_arm_angle'] > 90:
-            upper_arm_score +=4
+            upper_arm_score += 4
 
         upper_arm_score += 1 if self.arms['shoulder_raised'] else 0
         upper_arm_score += 1 if self.arms['arm_abducted'] else 0
         upper_arm_score -= 1 if self.arms['leaning'] else 0
 
-        # Lower arm position
+        # Lower arm position score calculation
         if 60 <= self.arms['lower_arm_angle'] <= 100:
             lower_arm_score += 1
         else:
             lower_arm_score += 2
 
-        # Wrist position
+        # Wrist position score calculation
         if -15 <= self.arms['wrist_angle'] <= 15:
             wrist_score += 1
         else:
@@ -142,19 +144,44 @@ class RebaScore:
 
         assert lower_arm_score > 0 and wrist_score > 0
         score_b = self.table_b[upper_arm_score-1][lower_arm_score-1][wrist_score-1]
-        return score_b, np.array([upper_arm_score, lower_arm_score, wrist_score])
 
-    def compute_score_c(self, score_a, score_b):
-        reba_scoring = ['Negligible Risk',
-                         'Low Risk. Change may be needed',
-                         'Medium Risk. Further Investigate. Change Soon',
-                         'High Risk. Investigate and Implement Change',
-                         'Very High Risk. Implement Change'
-                         ]
+        # Add coupling score to Table B result
+        coupling_score = self.arms['coupling_score']
+        score_b += coupling_score
+
+        return score_b, np.array([upper_arm_score, lower_arm_score, wrist_score, coupling_score])
+
+    def compute_activity_score(self, static_posture=False, repeated_action=False, rapid_large_change=False):
+        """
+        Compute REBA activity score (0-3).
+        """
+        activity_score = 0
+        activity_score += 1 if static_posture else 0
+        activity_score += 1 if repeated_action else 0
+        activity_score += 1 if rapid_large_change else 0
+        return activity_score
+
+    def compute_score_c(self, score_a, score_b, activity_score=0):
+        """
+        Compute final REBA score using Table C and activity score.
+        """
+        reba_scoring = [
+            'Negligible Risk',
+            'Low Risk. Change may be needed',
+            'Medium Risk. Further Investigate. Change Soon',
+            'High Risk. Investigate and Implement Change',
+            'Very High Risk. Implement Change'
+        ]
+        
+        # Ensure matrix indices are integers
+        score_a = int(score_a)
+        score_b = int(score_b)
+        
         score_c = self.table_c[score_a-1][score_b-1]
-        ix = self.score_c_to_5_classes(score_c)
+        final_score = score_c + activity_score
+        ix = self.score_c_to_5_classes(final_score)
         caption = reba_scoring[ix]
-        return score_c, caption
+        return score_c, final_score, caption
 
     @staticmethod
     def score_c_to_5_classes(score_c):
@@ -167,11 +194,6 @@ class RebaScore:
 
     @staticmethod
     def get_body_angles_from_pose_left(pose, verbose=False):
-        # NOTE (Deviation from original rs9000 package):
-        # Orijinal rs9000 paketi, iskeleti 2D düzleme döndürüp arctan2 kullanıyordu.
-        # Bu port, gerçek 3D derinlik verisine ve kameradan gelen Z ekseni gürültülerine 
-        # (oklüzyonlar) daha dayanıklı (robust) olması için doğrudan 3D vektör nokta çarpımı (dot product) 
-        # ve arccos matametiği kullanacak şekilde yeniden tasarlandı.
         pose = np.expand_dims(np.copy(pose), 0)
 
         mid_hip_3d = (pose[0, 8] + pose[0, 11]) / 2.0
@@ -189,7 +211,9 @@ class RebaScore:
 
         lateral_axis = pose[0, 2] - pose[0, 5]
         neck_sign_vec = np.cross(trunk_vec_3d, neck_vec_3d)
-        neck_sign = 1.0 if np.dot(neck_sign_vec, lateral_axis) < 0 else -1.0
+        
+        # FIX: Flipped < to >= for correct ZED depth orientation
+        neck_sign = 1.0 if np.dot(neck_sign_vec, lateral_axis) >= 0 else -1.0
         neck_angle = neck_sign * neck_angle
 
         cos_trunk_side = np.dot(trunk_vec_3d, lateral_axis) / (np.linalg.norm(trunk_vec_3d) * np.linalg.norm(lateral_axis) + 1e-9)
@@ -219,11 +243,6 @@ class RebaScore:
 
     @staticmethod
     def get_body_angles_from_pose_right(pose, verbose=False):
-        # NOTE (Deviation from original rs9000 package):
-        # Orijinal rs9000 paketi, iskeleti 2D düzleme döndürüp arctan2 kullanıyordu.
-        # Bu port, gerçek 3D derinlik verisine ve kameradan gelen Z ekseni gürültülerine 
-        # (oklüzyonlar) daha dayanıklı (robust) olması için doğrudan 3D vektör nokta çarpımı (dot product) 
-        # ve arccos matametiği kullanacak şekilde yeniden tasarlandı.
         pose = np.expand_dims(np.copy(pose), 0)
 
         mid_hip_3d = (pose[0, 8] + pose[0, 11]) / 2.0
@@ -241,7 +260,9 @@ class RebaScore:
 
         lateral_axis = pose[0, 2] - pose[0, 5]
         neck_sign_vec = np.cross(trunk_vec_3d, neck_vec_3d)
-        neck_sign = 1.0 if np.dot(neck_sign_vec, lateral_axis) < 0 else -1.0
+        
+        # FIX: Flipped < to >= for correct ZED depth orientation
+        neck_sign = 1.0 if np.dot(neck_sign_vec, lateral_axis) >= 0 else -1.0
         neck_angle = neck_sign * neck_angle
 
         cos_trunk_side = np.dot(trunk_vec_3d, lateral_axis) / (np.linalg.norm(trunk_vec_3d) * np.linalg.norm(lateral_axis) + 1e-9)
@@ -288,7 +309,9 @@ class RebaScore:
 
         lateral_axis = pose[0, 2] - pose[0, 5]
         upper_arm_sign_vec = np.cross(vertical_down, arm_vec_3d)
-        upper_arm_sign = 1.0 if np.dot(upper_arm_sign_vec, lateral_axis) < 0 else -1.0
+        
+        # FIX: Flipped < to >= for correct ZED depth orientation
+        upper_arm_sign = 1.0 if np.dot(upper_arm_sign_vec, lateral_axis) >= 0 else -1.0
         true_upper_arm_angle = upper_arm_sign * true_upper_arm_angle
 
         mid_shoulder_y = (pose[0, 2, 1] + pose[0, 5, 1]) / 2.0
@@ -335,7 +358,9 @@ class RebaScore:
 
         lateral_axis = pose[0, 2] - pose[0, 5]
         upper_arm_sign_vec = np.cross(vertical_down, arm_vec_3d)
-        upper_arm_sign = 1.0 if np.dot(upper_arm_sign_vec, lateral_axis) >= 0 else -1.0
+        
+        # FIX: Flipped >= to < for correct ZED depth orientation on the right arm
+        upper_arm_sign = 1.0 if np.dot(upper_arm_sign_vec, lateral_axis) < 0 else -1.0
         true_upper_arm_angle = upper_arm_sign * true_upper_arm_angle
 
         mid_shoulder_y = (pose[0, 2, 1] + pose[0, 5, 1]) / 2.0

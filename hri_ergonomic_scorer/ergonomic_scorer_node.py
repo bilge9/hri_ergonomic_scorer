@@ -48,17 +48,17 @@ RISK_NAMES = {
 }
 
 def is_valid(pt_obj, threshold=0.4):
-    # 1. Confidence kontrolü
+    # 1. Confidence check
     if hasattr(pt_obj, 'confidence') and pt_obj.confidence < threshold:
         return False
         
     pt = [pt_obj.x, pt_obj.y, pt_obj.z]
     
-    # 2. NaN (Not a Number) kontrolü
+    # 2. NaN (Not a Number) check
     if any(math.isnan(v) for v in pt):
         return False
         
-    # 3. Z-outlier veya sıfır noktası kontrolü
+    # 3. Z-outlier or zero point check
     if all(abs(v) < 1e-6 for v in pt):
         return False
         
@@ -90,14 +90,38 @@ class ErgonomicScorerNode(Node):
         self.declare_parameter('high_risk_threshold', 8)
         self.threshold = self.get_parameter('high_risk_threshold').get_parameter_value().integer_value
         
-        # True olan değeri False yapıyoruz ki kalabalık koordinatlar ekrana basılmasın
+        # Set to False to prevent printing verbose coordinate logs to screen
         self.declare_parameter('verbose_logging', False)
         self.verbose = self.get_parameter('verbose_logging').get_parameter_value().bool_value
 
         self.declare_parameter('confidence_threshold', 0.4)
         self.confidence_threshold = self.get_parameter('confidence_threshold').get_parameter_value().double_value
 
-        # Çıktı hızını kontrol etmek için yeni bir sözlük ekliyoruz
+        # --- REBA terms not derivable from skeleton geometry alone ---
+        # These cannot be computed from pose data (no hand/object tracking,
+        # no load-cell/scale input), so they are exposed as ROS parameters
+        # until a proper sensor/estimator feeds them. Defaults are the most
+        # conservative REBA values (no load, good coupling).
+        self.declare_parameter('load_kg', 0.0)
+        self.load_kg = self.get_parameter('load_kg').get_parameter_value().double_value
+
+        self.declare_parameter('coupling_score', 0)  # 0=good,1=fair,2=poor,3=unacceptable
+        self.coupling_score = self.get_parameter('coupling_score').get_parameter_value().integer_value
+
+        # --- REBA Activity modifier (0-3, see reba.py compute_activity_score) ---
+        # TODO: replace these manual overrides with a real per-body pose
+        # history tracker (static/repeated/rapid-change detection over time)
+        # once the DEBA work needs it too.
+        self.declare_parameter('activity_static', False)
+        self.activity_static = self.get_parameter('activity_static').get_parameter_value().bool_value
+
+        self.declare_parameter('activity_repeated', False)
+        self.activity_repeated = self.get_parameter('activity_repeated').get_parameter_value().bool_value
+
+        self.declare_parameter('activity_rapid_change', False)
+        self.activity_rapid_change = self.get_parameter('activity_rapid_change').get_parameter_value().bool_value
+
+        # Dictionary to control output print rate (throttling)
         self.last_print_times = {}
 
         self.get_logger().info(f"Parameter changed. Threshold: {self.threshold}")
@@ -108,12 +132,12 @@ class ErgonomicScorerNode(Node):
         for i, s in enumerate(getattr(msg, 'skeletons', [])):
             valid_joint_count = 0
             for pt_obj in s.skeleton:
-                # Eşik değerini node'un parametresinden alıyoruz
+                # Get threshold from node parameter
                 if is_valid(pt_obj, self.confidence_threshold):
                     valid_joint_count += 1
             
-            # Hayalet iskeletleri (örneğin sadece tek bir diz veya burun algılaması) yoksay.
-            # Bir iskeletin değerlendirmeye alınması için en az 5 geçerli eklemi olmalı.
+            # Ignore ghost skeletons (e.g. only a single knee or nose detected).
+            # A skeleton needs at least 5 valid joints to be evaluated.
             if valid_joint_count >= 5:
                 if not s.key or s.key.strip() == "":
                     s.key = f"human_untracked_{i}"
@@ -139,11 +163,11 @@ class ErgonomicScorerNode(Node):
 
     def _assess_body(self, body):
         pose_matrix = np.zeros((TOTAL_JOINTS, 3))
-        confidence_matrix = np.zeros(TOTAL_JOINTS)   # <-- yeni
+        confidence_matrix = np.zeros(TOTAL_JOINTS)   # <-- new
         valid_mask = np.zeros(TOTAL_JOINTS, dtype=bool)
         valid_joints_count = 0
 
-        # Vücudun genel güvenilirlik skorunu al ve 0.0 - 1.0 aralığına normalize et
+        # Get body overall confidence score and normalize to 0.0 - 1.0 range
         body_overall_conf = getattr(body, 'confidence', 0.0)
         if body_overall_conf > 1.0:
             body_overall_conf /= 100.0
@@ -152,7 +176,7 @@ class ErgonomicScorerNode(Node):
         for i in range(num_joints):
             pt_obj = body.skeleton[i]
             
-            # Eklemin kendi puanı yoksa vücudun genel puanını (body_overall_conf) kullan
+            # Use body overall confidence if joint-specific confidence is missing
             confidence_matrix[i] = getattr(pt_obj, 'confidence', body_overall_conf)
 
             if is_valid(pt_obj, self.confidence_threshold):
@@ -245,6 +269,9 @@ class ErgonomicScorerNode(Node):
                 body_conf[4] = body_conf[5] = region_conf["right_leg_conf"]
             elif body_side == "Left":
                 body_conf[4] = body_conf[5] = region_conf["left_leg_conf"]
+
+            body_angles[6] = self.load_kg
+
             reba.set_body(body_angles)
             score_a, partial_a = reba.compute_score_a()
             
@@ -255,37 +282,45 @@ class ErgonomicScorerNode(Node):
             assessment.leg_score = int(partial_a[2])
             assessment.body_confidence = body_conf.tolist()
 
-            # 2. GROUP B (ARM) CALCULATION - Independent Parts
-            arm_angles = np.zeros(7)
-            arm_side = "Unknown"
-            
+            # 2. GROUP B (ARM) CALCULATION - BILATERAL AGGREGATION
             calc_arm_r = reba.get_arms_angles_from_pose_right(reba_pose)
             calc_arm_l = reba.get_arms_angles_from_pose_left(reba_pose)
             
-            eval_r_upper = calc_arm_r[0] if readiness["right_upper_arm_ok"] else 0
-            eval_l_upper = calc_arm_l[0] if readiness["left_upper_arm_ok"] else 0
+            score_b_r, partial_b_r = 0, [0, 0, 0, 0]
+            score_b_l, partial_b_l = 0, [0, 0, 0, 0]
             
-            if readiness["right_upper_arm_ok"] or readiness["right_lower_arm_ok"]:
-                # We will process Right Arm
-                if readiness["right_upper_arm_ok"]:
-                    arm_angles[0] = calc_arm_r[0]
-                    arm_angles[1] = calc_arm_r[1]
-                    arm_angles[2] = calc_arm_r[2]
-                    arm_angles[3] = calc_arm_r[3]
-                if readiness["right_lower_arm_ok"]:
-                    arm_angles[4] = calc_arm_r[4]
-                arm_side = "Right"
+            # Compute Score B for right arm
+            if readiness["right_arm_ok"]:
+                arm_angles_r = np.zeros(8)
+                arm_angles_r[:7] = calc_arm_r
+                arm_angles_r[7] = self.coupling_score
+                reba.set_arms(arm_angles_r)
+                score_b_r, partial_b_r = reba.compute_score_b()
 
-            elif readiness["left_upper_arm_ok"] or readiness["left_lower_arm_ok"]:
-                # We will process Left Arm
-                if readiness["left_upper_arm_ok"]:
-                    arm_angles[0] = calc_arm_l[0]
-                    arm_angles[1] = calc_arm_l[1]
-                    arm_angles[2] = calc_arm_l[2]
-                    arm_angles[3] = calc_arm_l[3]
-                if readiness["left_lower_arm_ok"]:
-                    arm_angles[4] = calc_arm_l[4]
+            # Compute Score B for left arm
+            if readiness["left_arm_ok"]:
+                arm_angles_l = np.zeros(8)
+                arm_angles_l[:7] = calc_arm_l
+                arm_angles_l[7] = self.coupling_score
+                reba.set_arms(arm_angles_l)
+                score_b_l, partial_b_l = reba.compute_score_b()
+
+            # Compare both arms and select the highest risk score
+            arm_angles = np.zeros(7)
+            if score_b_r >= score_b_l and score_b_r > 0:
+                score_b = score_b_r
+                partial_b = partial_b_r
+                arm_side = "Right"
+                arm_angles = calc_arm_r
+            elif score_b_l > score_b_r:
+                score_b = score_b_l
+                partial_b = partial_b_l
                 arm_side = "Left"
+                arm_angles = calc_arm_l
+            else:
+                score_b = 0
+                partial_b = [0, 0, 0, 0]
+                arm_side = "Unknown"
 
             arm_conf = np.zeros(7)
             if arm_side == "Right":
@@ -294,8 +329,6 @@ class ErgonomicScorerNode(Node):
             elif arm_side == "Left":
                 arm_conf[0] = arm_conf[1] = arm_conf[2] = arm_conf[3] = region_conf["left_upper_arm_conf"]
                 arm_conf[4] = region_conf["left_lower_arm_conf"]
-            reba.set_arms(arm_angles)
-            score_b, partial_b = reba.compute_score_b()
 
             assessment.group_b_valid = True if arm_side != "Unknown" else False
             assessment.score_b = int(score_b)
@@ -305,33 +338,40 @@ class ErgonomicScorerNode(Node):
             assessment.arm_confidence = arm_conf.tolist()
 
             # 3. FINAL SCORE (C) CALCULATION
-            # Even if a group is completely occluded, it defaults to a minimum risk score of 1.
-            # 3. FINAL SCORE (C) CALCULATION
-            # Even if a group is completely occluded, it defaults to a minimum risk score of 1.
-            score_c, risk_lvl = reba.compute_score_c(score_a, score_b)
-            assessment.score_c = int(score_c)
+            # Compute activity score
+            activity_score = reba.compute_activity_score(
+                self.activity_static, 
+                self.activity_repeated, 
+                self.activity_rapid_change
+            )
             
-            if score_c <= 1: risk_num = 0
-            elif score_c <= 3: risk_num = 1
-            elif score_c <= 7: risk_num = 2
-            elif score_c <= 10: risk_num = 3
+            # Get final REBA score (up to 15)
+            score_c_raw, final_score, caption = reba.compute_score_c(score_a, score_b, activity_score)
+            
+            assessment.score_c = int(final_score)
+            
+            # Map risk level based on final score
+            if final_score <= 1: risk_num = 0
+            elif final_score <= 3: risk_num = 1
+            elif final_score <= 7: risk_num = 2
+            elif final_score <= 10: risk_num = 3
             else: risk_num = 4
             
             assessment.risk_level = risk_num
+            risk_lvl = caption
 
-            # --- EKRAN ÇIKTISINI YAVAŞLATMA (THROTTLE) ---
-            # Zamanı saniye cinsinden alıyoruz
+            # --- THROTTLE SCREEN OUTPUT ---
             current_time = self.get_clock().now().nanoseconds / 1e9
             last_time = self.last_print_times.get(body.key, 0.0)
             
-            # Sadece 0.5 saniyede bir (saniyede 2 kez) ekrana yazdırmaya izin ver
+            # Allow printing to screen twice a second (every 0.5 seconds)
             if current_time - last_time > 0.5:
                 # Dashboard Print
                 self._print_reba_breakdown(
                     key=body.key,
                     score_a=score_a,
                     score_b=score_b,
-                    score_c=score_c,
+                    score_c=score_c_raw,
                     risk_lvl=risk_lvl,
                     completeness=completeness,
                     valid_joints=valid_joints_count,
@@ -343,17 +383,14 @@ class ErgonomicScorerNode(Node):
                     arm_conf=arm_conf
                 )
                 
-                # Eğer parametrelerden verbose_logging tekrar True yapılırsa ham koordinatları da yazdırır
+                # Print raw coordinates if verbose logging is enabled
                 if self.verbose:
                     self._print_raw_dump(body.key, pose_matrix, completeness)
                     
-                # Son yazdırma zamanını kaydet
                 self.last_print_times[body.key] = current_time
 
         except Exception as e:
             self.get_logger().error(f"[{body.key}] REBA calculation error: {e}")
-
-        # Not: Eski koddaki if self.verbose bloğu buradan silinip yukarıdaki zamanlayıcının içine taşındı.
 
         return assessment
 
@@ -405,7 +442,6 @@ class ErgonomicScorerNode(Node):
         raw_dump = ""
         for i in range(TOTAL_JOINTS):
             pt = pose_matrix[i]
-            # NumPy dizisi olduğu için is_valid yerine doğrudan sıfır noktası kontrolü yapıyoruz
             if any(abs(v) > 1e-6 for v in pt):
                 raw_dump += f"  {JOINT_NAMES[i]:<12}: [X: {pt[0]:5.2f}, Y: {pt[1]:5.2f}, Z: {pt[2]:5.2f}]\n"
             else:

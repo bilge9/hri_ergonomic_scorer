@@ -170,7 +170,6 @@ class FiwareRebaBridgeNode(Node):
     def reba_callback(self, msg):
         """Process all REBA assessments received in the RebaAssessmentList message."""
         
-        # Zaman damgasını rosbag'in kayıtlı ROS mesaj başlığından (header) al
         timestamp = self.get_iso_time_from_header(msg.header)
 
         for assessment in msg.assessments:
