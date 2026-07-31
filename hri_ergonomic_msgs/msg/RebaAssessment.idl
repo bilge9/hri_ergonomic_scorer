@@ -63,11 +63,13 @@ module hri_ergonomic_msgs {
       uint8 neck_score;
       uint8 trunk_score;
       uint8 leg_score;
+      uint8 load_score;
 
       // Group B (Arm) Partial Scores
       uint8 upper_arm_score;
       uint8 lower_arm_score;
       uint8 wrist_score;
+      uint8 coupling_score;
     };
 
   };

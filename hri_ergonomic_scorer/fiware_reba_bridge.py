@@ -93,6 +93,11 @@ class FiwareRebaBridgeNode(Node):
                 "value": int(assessment.leg_score),
                 "observedAt": timestamp
             },
+            "loadScore": {
+                "type": "Property",
+                "value": int(assessment.load_score),
+                "observedAt": timestamp
+            },
             # --- Per-region REBA breakdown (Group B: arm) ---
             "upperArmScore": {
                 "type": "Property",
@@ -107,6 +112,11 @@ class FiwareRebaBridgeNode(Node):
             "wristScore": {
                 "type": "Property",
                 "value": int(assessment.wrist_score),
+                "observedAt": timestamp
+            },
+            "couplingScore": {
+                "type": "Property",
+                "value": int(assessment.coupling_score),
                 "observedAt": timestamp
             },
             "neckConfidence": {

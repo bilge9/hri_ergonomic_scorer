@@ -224,50 +224,61 @@ class ErgonomicScorerNode(Node):
             
             # 1. GROUP A (BODY) CALCULATION - Independent Parts
             body_angles = np.zeros(7)
-            body_side = "Unknown"
-            
+            body_side = "Unknown"  # overall Group A validity flag (any part computed)
+            # NOTE: neck/trunk angles are computed from joints shared by both
+            # sides (mid-hip average, both shoulders) - get_body_angles_from_
+            # pose_left/right give IDENTICAL neck/trunk results, only the leg
+            # calculation actually differs by side. So "side" only has real
+            # meaning for the legs; leg_side is tracked separately below and
+            # is what gets shown on the dashboard, instead of overloading a
+            # single body_side as if it described the whole Group A.
+            leg_side = "Unknown"
+
             calc_angles_r = reba.get_body_angles_from_pose_right(reba_pose)
             calc_angles_l = reba.get_body_angles_from_pose_left(reba_pose)
 
-            # Neck
+            # Neck (side-independent, see NOTE above - calc_angles_r/_l give the same value)
             if readiness["neck_ok"]:
                 body_angles[0] = calc_angles_r[0]
                 body_angles[1] = calc_angles_r[1]
-                body_side = "Right" 
-                
-            # Trunk
+                body_side = "Computed"
+
+            # Trunk (side-independent, see NOTE above)
             if readiness["trunk_ok"]:
                 body_angles[2] = calc_angles_r[2]
                 body_angles[3] = calc_angles_r[3]
-                body_side = "Right"
+                body_side = "Computed"
 
             # Legs (Choose the leg that is valid, if both are valid choose highest risk angle)
             if readiness["right_leg_ok"] and readiness["left_leg_ok"]:
                 if abs(calc_angles_r[5]) >= abs(calc_angles_l[5]):
                     body_angles[4] = calc_angles_r[4]
                     body_angles[5] = calc_angles_r[5]
-                    body_side = "Right"
+                    leg_side = "Right"
                 else:
                     body_angles[4] = calc_angles_l[4] 
                     body_angles[5] = calc_angles_l[5] 
-                    body_side = "Left"
+                    leg_side = "Left"
             elif readiness["right_leg_ok"]:
                 body_angles[4] = calc_angles_r[4] 
                 body_angles[5] = calc_angles_r[5] 
-                body_side = "Right"
+                leg_side = "Right"
             elif readiness["left_leg_ok"]:
                 body_angles[4] = calc_angles_l[4] 
                 body_angles[5] = calc_angles_l[5] 
-                body_side = "Left"
+                leg_side = "Left"
+
+            if leg_side != "Unknown":
+                body_side = "Computed"
 
             body_conf = np.zeros(7)
             if readiness["neck_ok"]:
                 body_conf[0] = body_conf[1] = region_conf["neck_conf"]
             if readiness["trunk_ok"]:
                 body_conf[2] = body_conf[3] = region_conf["trunk_conf"]
-            if body_side == "Right":
+            if leg_side == "Right":
                 body_conf[4] = body_conf[5] = region_conf["right_leg_conf"]
-            elif body_side == "Left":
+            elif leg_side == "Left":
                 body_conf[4] = body_conf[5] = region_conf["left_leg_conf"]
 
             body_angles[6] = self.load_kg
@@ -280,6 +291,7 @@ class ErgonomicScorerNode(Node):
             assessment.neck_score = int(partial_a[0])
             assessment.trunk_score = int(partial_a[1])
             assessment.leg_score = int(partial_a[2])
+            assessment.load_score = int(partial_a[3])
             assessment.body_confidence = body_conf.tolist()
 
             # 2. GROUP B (ARM) CALCULATION - BILATERAL AGGREGATION
@@ -335,6 +347,7 @@ class ErgonomicScorerNode(Node):
             assessment.upper_arm_score = int(partial_b[0])
             assessment.lower_arm_score = int(partial_b[1])
             assessment.wrist_score = int(partial_b[2])
+            assessment.coupling_score = int(partial_b[3])
             assessment.arm_confidence = arm_conf.tolist()
 
             # 3. FINAL SCORE (C) CALCULATION
@@ -376,6 +389,7 @@ class ErgonomicScorerNode(Node):
                     completeness=completeness,
                     valid_joints=valid_joints_count,
                     body_side=body_side,
+                    leg_side=leg_side,
                     arm_side=arm_side,
                     body_angles=body_angles,
                     arm_angles=arm_angles,
@@ -404,6 +418,7 @@ class ErgonomicScorerNode(Node):
         completeness,
         valid_joints,
         body_side,
+        leg_side,
         arm_side,
         body_angles,
         arm_angles,
@@ -418,7 +433,8 @@ class ErgonomicScorerNode(Node):
         text += f"┃ Completeness: {completeness*100:3.0f}% ({valid_joints}/18 joints)                          ┃\n"
         text += f"┃ Final Score : {score_c:<2}  =>  {risk_lvl:<36} ┃\n"
         text += f"┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n"
-        text += f"┃ [GROUP A: BODY] Evaluated Side: {body_side:<30} ┃\n"
+        text += f"┃ [GROUP A: BODY] Leg Side Used: {leg_side:<28} ┃\n"
+        text += f"┃   (Neck/Trunk are side-independent - not tied to leg side)     ┃\n"
         text += f"┠────────────────────────────────────────────────────────────────┨\n"
 
         for name, value, conf in zip(BODY_ANGLE_NAMES, body_angles, body_conf):
