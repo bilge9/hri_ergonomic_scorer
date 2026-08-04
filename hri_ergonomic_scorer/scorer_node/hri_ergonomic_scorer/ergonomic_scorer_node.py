@@ -10,6 +10,24 @@ from hri_ergonomic_msgs.msg import RebaAssessment, RebaAssessmentList
 from .reba import RebaScore
 from .pose_remap import remap_pose_to_reba, reba_inputs_are_sufficient, remap_scalar_to_reba, reba_region_confidence
 
+import os
+import torch
+import torch.nn as nn
+
+class DebaMLP(nn.Module):
+    def __init__(self, input_dim=18):
+        super(DebaMLP, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, x):
+        return self.network(x)
+
 TOTAL_JOINTS = 18
 
 JOINT_NAMES = [
@@ -126,6 +144,17 @@ class ErgonomicScorerNode(Node):
 
         self.get_logger().info(f"Parameter changed. Threshold: {self.threshold}")
         self.get_logger().info("Ergonomic Scorer Node started. Granular partial REBA enabled.")
+        self.device = torch.device("cpu") # Sadece çıkarım (inference) yapacağımız için CPU fazlasıyla yeterli
+        self.deba_model = DebaMLP(input_dim=18).to(self.device)
+        
+        model_path = os.path.expanduser('~/hri_ws/src/hri_ergonomic_scorer/hri_ergonomic_scorer/scorer_node/hri_ergonomic_scorer/deba_model.pth')
+        
+        try:
+            self.deba_model.load_state_dict(torch.load(model_path, map_location=self.device))
+            self.deba_model.eval() # Eğitimi kapat, sadece tahmin yap
+            self.get_logger().info(f"DEBA PyTorch modeli basariyla yuklendi: {model_path}")
+        except Exception as e:
+            self.get_logger().error(f"DEBA Modeli yuklenemedi! Hata: {e}")
 
     def skeleton_callback(self, msg):
         active_bodies = []
@@ -362,6 +391,24 @@ class ErgonomicScorerNode(Node):
             score_c_raw, final_score, caption = reba.compute_score_c(score_a, score_b, activity_score)
             
             assessment.score_c = int(final_score)
+
+            # YENI EKLENDI: DEBA Skoru Çıkarımı (Inference)
+            # CSV veri setindeki sırayla 18 adet feature'ı diziyoruz.
+            # body_angles: 0:Neck, 1:NeckSide, 2:Trunk, 3:TrunkSide, 4:Walking, 5:LegAngle, 6:Load 
+            # arm_angles: 0:UpperArm, 1:ShoulderRaised, 2:ArmAbducted, 3:Leaning, 4:LowerArm, 5:WristAngle, 6:WristTwisted
+            with torch.no_grad():
+                deba_input = [
+                    float(body_angles[0]), float(body_angles[2]), float(body_angles[5]), float(body_angles[6]), # Neck, Trunk, Leg, Load
+                    float(arm_angles[0]), float(arm_angles[4]), float(arm_angles[5]),                           # Upper, Lower, Wrist
+                    float(body_angles[1]), float(body_angles[3]), float(body_angles[4]),                        # NeckSide, TrunkSide, Walking
+                    float(arm_angles[1]), float(arm_angles[2]), float(arm_angles[3]), float(arm_angles[6]),     # Sh.Raised, Abd, Leaning, Tw.
+                    float(self.activity_static), float(self.activity_repeated), float(self.activity_rapid_change),
+                    float(self.coupling_score)
+                ]
+                tensor_input = torch.tensor([deba_input], dtype=torch.float32).to(self.device)
+                predicted_deba = self.deba_model(tensor_input).item()
+                
+            assessment.deba_score = float(predicted_deba)
             
             # Map risk level based on final score
             if final_score <= 1: risk_num = 0
@@ -394,7 +441,8 @@ class ErgonomicScorerNode(Node):
                     body_angles=body_angles,
                     arm_angles=arm_angles,
                     body_conf=body_conf,
-                    arm_conf=arm_conf
+                    arm_conf=arm_conf,
+                    deba_score=predicted_deba
                 )
                 
                 # Print raw coordinates if verbose logging is enabled
@@ -423,15 +471,17 @@ class ErgonomicScorerNode(Node):
         body_angles,
         arm_angles,
         body_conf, 
-        arm_conf
+        arm_conf,
+        deba_score
     ):
         text = f"\n"
         text += f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
         text += f"┃ REBA ASSESSMENT DASHBOARD                                      ┃\n"
         text += f"┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n"
-        text += f"┃ Target ID : {key:<50} ┃\n"
-        text += f"┃ Completeness: {completeness*100:3.0f}% ({valid_joints}/18 joints)                          ┃\n"
-        text += f"┃ Final Score : {score_c:<2}  =>  {risk_lvl:<36} ┃\n"
+        text += f"┃ Target ID : {key:<50}                                          ┃\n"
+        text += f"┃ Completeness: {completeness*100:3.0f}% ({valid_joints}/18 joints)┃\n"
+        text += f"┃ Final Score : {score_c:<2}  =>  {risk_lvl:<36}                 ┃\n"
+        text += f"┃ DEBA Score  : {deba_score:<5.2f}                               ┃\n"
         text += f"┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\n"
         text += f"┃ [GROUP A: BODY] Leg Side Used: {leg_side:<28} ┃\n"
         text += f"┃   (Neck/Trunk are side-independent - not tied to leg side)     ┃\n"

@@ -38,13 +38,18 @@ class FiwareRebaBridgeNode(Node):
 
     def send_to_orion_ld(self, assessment, timestamp):
         """Send a single valid ergonomic assessment to Orion-LD."""
-        entity_id = f"urn:ngsi-ld:ErgonomicAssessment:{assessment.key}"
+        entity_id = f"urn:ngsi-ld:ErgonomicAssessment:v2:{assessment.key}"
 
         # NGSI-LD PATCH payload containing all REBA assessment attributes
         patch_payload = {
             "completeness": {
                 "type": "Property",
                 "value": float(assessment.completeness),
+                "observedAt": timestamp
+            },
+            "debaScore": {
+                "type": "Property",
+                "value": float(assessment.deba_score),
                 "observedAt": timestamp
             },
             "scoreA": {

@@ -48,6 +48,7 @@ module hri_ergonomic_msgs {
       std_msgs::msg::Header header;
 
       float completeness;
+      float deba_score;
 
       uint8 score_a;
       uint8 score_b;
