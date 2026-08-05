@@ -115,13 +115,14 @@ class RebaScore:
         upper_arm_score, lower_arm_score, wrist_score = 0, 0, 0
 
         # Upper arm position score calculation
-        if -20 <= self.arms['upper_arm_angle'] <= 20:
+        angle = self.arms['upper_arm_angle']
+        if -20 <= angle <= 20:
             upper_arm_score += 1
-        elif self.arms['upper_arm_angle'] <= 45:
+        elif (20 < angle <= 45) or (-45 <= angle < -20):
             upper_arm_score += 2
-        elif 45 <= self.arms['upper_arm_angle'] <= 90:
+        elif (45 < angle <= 90) or (-90 <= angle < -45):
             upper_arm_score += 3
-        elif self.arms['upper_arm_angle'] > 90:
+        else: # angle > 90 or angle < -90
             upper_arm_score += 4
 
         upper_arm_score += 1 if self.arms['shoulder_raised'] else 0
@@ -375,7 +376,7 @@ class RebaScore:
         vertical_up = np.array([0.0, 1.0, 0.0])
         cos_trunk = np.dot(trunk_vec_3d, vertical_up) / (np.linalg.norm(trunk_vec_3d) + 1e-9)
         trunk_angle = np.degrees(np.arccos(np.clip(cos_trunk, -1.0, 1.0)))
-        leaning = 1 if trunk_angle > 60.0 else 0
+        leaning = 1 if trunk_angle > 30.0 else 0
 
         lower_arm_angle = true_lower_arm_angle
         wrist_angle = 0

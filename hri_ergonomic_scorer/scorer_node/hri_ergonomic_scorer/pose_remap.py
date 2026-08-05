@@ -28,24 +28,17 @@ V2R = {
 
 REBA_JOINT_COUNT = 14  
 
-SWAP_Y_Z = True
-FLIP_Y_SIGN = False
-
-def remap_pose_to_reba(pose_matrix: np.ndarray, valid_mask: np.ndarray):
+def remap_pose_to_reba(pose_matrix: np.ndarray, valid_mask: np.ndarray, swap_y_z: bool = False, flip_y_sign: bool = False):
     """
     pose_matrix: (18,3) array, Vulcanexus COCO-18 order.
     valid_mask:  (18,) bool array.
-
-    Returns:
-      reba_pose:  (14,3) array, rs9000 order.
-      reba_valid: (14,) bool array, same remapping applied.
     """
     src = pose_matrix
-    if SWAP_Y_Z or FLIP_Y_SIGN:
+    if swap_y_z or flip_y_sign:
         src = pose_matrix.copy()
-        if SWAP_Y_Z:
+        if swap_y_z:
             src[:, [1, 2]] = src[:, [2, 1]]
-        if FLIP_Y_SIGN:
+        if flip_y_sign:
             src[:, 1] = -src[:, 1]
 
     reba_pose = np.zeros((REBA_JOINT_COUNT, 3))

@@ -115,6 +115,7 @@ class SkeletonOverlayNode(Node):
         self.declare_parameter('camera_image_topic', '')
         self.declare_parameter('camera_info_topic', '')
         self.declare_parameter('output_topic', '/humans/bodies/skel3D/overlay')
+        self.declare_parameter('projection_mode', 'optical')
 
         image_topic = self.get_parameter('camera_image_topic').get_parameter_value().string_value
         info_topic = self.get_parameter('camera_info_topic').get_parameter_value().string_value
@@ -192,8 +193,18 @@ class SkeletonOverlayNode(Node):
                     h, w = CANVAS_SIZE
                     scale = 150
                     
-                    u = int(w / 2 + (dx - dy) * 0.707 * scale)
-                    v = int(h / 2 - dz * scale + (dx + dy) * 0.35 * scale)
+                    # YENİ EKLENEN: Dinamik Projeksiyon Seçimi
+                    mode = self.get_parameter('projection_mode').get_parameter_value().string_value
+                    
+                    if mode == 'isometric':
+                        # Eski sistem: Z ekseninin yukarıda olduğu açılı görünüm
+                        u = int(w / 2 + (dx - dy) * 0.707 * scale)
+                        v = int(h / 2 - dz * scale + (dx + dy) * 0.35 * scale)
+                    else:
+                        # Optik sistem: Standart kamera düzlemi (X yatay, Y dikey)
+                        u = int(w / 2 + dx * scale)
+                        v = int(h / 2 + dy * scale)
+                        
                     points_2d[i] = (u, v)
                 else:
                     points_2d[i] = project_fn(pt)

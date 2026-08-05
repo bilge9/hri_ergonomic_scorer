@@ -139,6 +139,9 @@ class ErgonomicScorerNode(Node):
         self.declare_parameter('activity_rapid_change', False)
         self.activity_rapid_change = self.get_parameter('activity_rapid_change').get_parameter_value().bool_value
 
+        self.declare_parameter('swap_y_z', False)
+        self.declare_parameter('flip_y_sign', True)
+
         # Dictionary to control output print rate (throttling)
         self.last_print_times = {}
 
@@ -238,7 +241,12 @@ class ErgonomicScorerNode(Node):
         if valid_joints_count == 0:
             return None
 
-        reba_pose, reba_valid = remap_pose_to_reba(pose_matrix, valid_mask)
+        # Parametreleri dinamik olarak çek
+        p_swap = self.get_parameter('swap_y_z').get_parameter_value().bool_value
+        p_flip = self.get_parameter('flip_y_sign').get_parameter_value().bool_value
+
+        # Fonksiyona gönder
+        reba_pose, reba_valid = remap_pose_to_reba(pose_matrix, valid_mask, swap_y_z=p_swap, flip_y_sign=p_flip)  
         readiness = reba_inputs_are_sufficient(reba_valid)
 
         reba_confidence = remap_scalar_to_reba(confidence_matrix)
