@@ -109,6 +109,10 @@ class RebaScore:
         # Add load score to Table A result
         score_a += load_score
 
+        neck_score = max(1, neck_score)
+        trunk_score = max(1, trunk_score)
+        leg_score = max(1, leg_score)
+
         return score_a, np.array([neck_score, trunk_score, leg_score, load_score])
 
     def compute_score_b(self):
@@ -128,6 +132,8 @@ class RebaScore:
         upper_arm_score += 1 if self.arms['shoulder_raised'] else 0
         upper_arm_score += 1 if self.arms['arm_abducted'] else 0
         upper_arm_score -= 1 if self.arms['leaning'] else 0
+
+        upper_arm_score = max(1, upper_arm_score)
 
         # Lower arm position score calculation
         if 60 <= self.arms['lower_arm_angle'] <= 100:

@@ -3,6 +3,11 @@ from rclpy.node import Node
 import numpy as np
 import math
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from ament_index_python.packages import get_package_share_directory
+import time
+
+import threading
+import queue
 
 from hri_msgs.msg import Skeleton3DList
 from hri_ergonomic_msgs.msg import RebaAssessment, RebaAssessmentList
@@ -150,8 +155,9 @@ class ErgonomicScorerNode(Node):
         self.device = torch.device("cpu") # Sadece çıkarım (inference) yapacağımız için CPU fazlasıyla yeterli
         self.deba_model = DebaMLP(input_dim=18).to(self.device)
         
-        model_path = os.path.expanduser('~/hri_ws/src/hri_ergonomic_scorer/hri_ergonomic_scorer/scorer_node/hri_ergonomic_scorer/deba_model.pth')
-        
+        package_share_directory = get_package_share_directory('hri_ergonomic_scorer')
+        model_path = os.path.join(package_share_directory, 'models', 'deba_model.pth')
+
         try:
             self.deba_model.load_state_dict(torch.load(model_path, map_location=self.device))
             self.deba_model.eval() # Eğitimi kapat, sadece tahmin yap
@@ -159,17 +165,46 @@ class ErgonomicScorerNode(Node):
         except Exception as e:
             self.get_logger().error(f"DEBA Modeli yuklenemedi! Hata: {e}")
 
+        self.skel_queue = queue.Queue(maxsize=5) 
+        
+        self.inference_thread = threading.Thread(target=self.inference_worker)
+        self.inference_thread.daemon = True # Ana program kapandığında thread de otomatik kapansın
+        self.inference_thread.start()
+        self.get_logger().info("Background ML Inference thread started.")
+
     def skeleton_callback(self, msg):
+        """PRODUCER: Ana thread'i bloklamadan mesajı alır ve kuyruğa bırakır."""
+        try:
+            # put_nowait: Eğer model yavaş kalır ve kuyruk dolarsa sistemi durdurmaz.
+            self.skel_queue.put_nowait(msg)
+        except queue.Full:
+            # Kuyruk doluysa bu kareyi (frame) atlıyoruz. 
+            pass 
+
+    def inference_worker(self):
+        """CONSUMER: Arka planda durmaksızın çalışan ML ve REBA hesaplama döngüsü."""
+        while rclpy.ok():
+            try:
+                # Kuyruktan mesaj bekle.
+                msg = self.skel_queue.get(timeout=0.1)
+                self._process_message(msg)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                self.get_logger().error(f"Inference worker error: {e}")
+
+    def _process_message(self, msg):
+        """Asıl hesaplama ve ROS 2 yayınlama işleminin yapıldığı ve sürenin ölçüldüğü yer."""
+        # 1. KRONOMETREYİ BAŞLAT
+        start_time = time.perf_counter()
+
         active_bodies = []
         for i, s in enumerate(getattr(msg, 'skeletons', [])):
             valid_joint_count = 0
             for pt_obj in s.skeleton:
-                # Get threshold from node parameter
                 if is_valid(pt_obj, self.confidence_threshold):
                     valid_joint_count += 1
             
-            # Ignore ghost skeletons (e.g. only a single knee or nose detected).
-            # A skeleton needs at least 5 valid joints to be evaluated.
             if valid_joint_count >= 5:
                 if not s.key or s.key.strip() == "":
                     s.key = f"human_untracked_{i}"
@@ -192,6 +227,19 @@ class ErgonomicScorerNode(Node):
                 
         if out_index > 0:
             self.reba_pub.publish(out_list)
+
+        # 2. KRONOMETREYİ DURDUR VE HESAPLA
+        end_time = time.perf_counter()
+        processing_time_ms = (end_time - start_time) * 1000.0
+        
+        # Log kirliliğini önlemek için sadece saniyede 1 kez ekrana bas
+        current_sec = msg.header.stamp.sec
+        if not hasattr(self, 'last_log_sec') or current_sec != self.last_log_sec:
+            self.get_logger().info(
+                f"[Real-Time Profiler] Processed {out_index} human(s) in {processing_time_ms:.2f} ms "
+                f"| Max possible FPS: {1000.0 / processing_time_ms if processing_time_ms > 0 else 0:.1f}"
+            )
+            self.last_log_sec = current_sec
 
     def _assess_body(self, body):
         pose_matrix = np.zeros((TOTAL_JOINTS, 3))
