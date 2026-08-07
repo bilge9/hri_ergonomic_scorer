@@ -227,6 +227,9 @@ def main():
     parser.add_argument("--exclude-wrist", action="store_true")
     args = parser.parse_args()
 
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     include_wrist = not args.exclude_wrist

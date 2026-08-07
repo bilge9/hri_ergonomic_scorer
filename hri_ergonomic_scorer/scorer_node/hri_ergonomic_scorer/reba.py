@@ -211,25 +211,32 @@ class RebaScore:
         cos_trunk = np.clip(cos_trunk, -1.0, 1.0)
         trunk_angle = np.degrees(np.arccos(cos_trunk))
 
-        neck_vec_3d = pose[0, 0] - pose[0, 1]
-        cos_neck = np.dot(trunk_vec_3d, neck_vec_3d) / (np.linalg.norm(trunk_vec_3d) * np.linalg.norm(neck_vec_3d) + 1e-9)
-        cos_neck = np.clip(cos_neck, -1.0, 1.0)
-        neck_angle = np.degrees(np.arccos(cos_neck))
-
+        # --- Body-fixed orthonormal frame (Gram-Schmidt) ---
+        # Decomposing the neck vector in this frame separates flexion from
+        # lateral bend. The previous approach took the full 3D trunk-to-neck
+        # angle and assigned a sign via cross product, which is undefined for
+        # a purely lateral bend and flips ~130 degrees on tiny pose changes.
         lateral_axis = pose[0, 2] - pose[0, 5]
-        neck_sign_vec = np.cross(trunk_vec_3d, neck_vec_3d)
-        
-        # FIX: Flipped < to >= for correct ZED depth orientation
-        neck_sign = 1.0 if np.dot(neck_sign_vec, lateral_axis) >= 0 else -1.0
-        neck_angle = neck_sign * neck_angle
+
+        e_up = trunk_vec_3d / (np.linalg.norm(trunk_vec_3d) + 1e-9)
+        lat_perp = lateral_axis - np.dot(lateral_axis, e_up) * e_up
+        e_lat = lat_perp / (np.linalg.norm(lat_perp) + 1e-9)
+        e_fwd = np.cross(e_lat, e_up)
+        e_fwd = e_fwd / (np.linalg.norm(e_fwd) + 1e-9)
+
+        neck_vec_3d = pose[0, 0] - pose[0, 1]
+        c_up = np.dot(neck_vec_3d, e_up)
+        c_fwd = np.dot(neck_vec_3d, e_fwd)
+        c_lat = np.dot(neck_vec_3d, e_lat)
+
+        # atan2 is continuous -> no sign-flip discontinuity
+        neck_angle = np.degrees(np.arctan2(c_fwd, c_up))
+        neck_side_angle = abs(np.degrees(np.arctan2(c_lat, c_up)))
+        neck_side = 1 if neck_side_angle > 10.0 else 0
 
         cos_trunk_side = np.dot(trunk_vec_3d, lateral_axis) / (np.linalg.norm(trunk_vec_3d) * np.linalg.norm(lateral_axis) + 1e-9)
         trunk_side_angle = abs(90.0 - np.degrees(np.arccos(np.clip(cos_trunk_side, -1.0, 1.0))))
         trunk_side = 1 if trunk_side_angle > 10.0 else 0
-
-        cos_neck_side = np.dot(neck_vec_3d, lateral_axis) / (np.linalg.norm(neck_vec_3d) * np.linalg.norm(lateral_axis) + 1e-9)
-        neck_side_angle = abs(90.0 - np.degrees(np.arccos(np.clip(cos_neck_side, -1.0, 1.0))))
-        neck_side = 1 if neck_side_angle > 10.0 else 0
 
         step_size = np.linalg.norm(pose[0, 10] - pose[0, 13])
         legs_walking = 1 if step_size > 0.1 else 0
@@ -260,25 +267,27 @@ class RebaScore:
         cos_trunk = np.clip(cos_trunk, -1.0, 1.0)
         trunk_angle = np.degrees(np.arccos(cos_trunk))
 
-        neck_vec_3d = pose[0, 0] - pose[0, 1]
-        cos_neck = np.dot(trunk_vec_3d, neck_vec_3d) / (np.linalg.norm(trunk_vec_3d) * np.linalg.norm(neck_vec_3d) + 1e-9)
-        cos_neck = np.clip(cos_neck, -1.0, 1.0)
-        neck_angle = np.degrees(np.arccos(cos_neck))
-
         lateral_axis = pose[0, 2] - pose[0, 5]
-        neck_sign_vec = np.cross(trunk_vec_3d, neck_vec_3d)
-        
-        # FIX: Flipped < to >= for correct ZED depth orientation
-        neck_sign = 1.0 if np.dot(neck_sign_vec, lateral_axis) >= 0 else -1.0
-        neck_angle = neck_sign * neck_angle
+
+        e_up = trunk_vec_3d / (np.linalg.norm(trunk_vec_3d) + 1e-9)
+        lat_perp = lateral_axis - np.dot(lateral_axis, e_up) * e_up
+        e_lat = lat_perp / (np.linalg.norm(lat_perp) + 1e-9)
+        e_fwd = np.cross(e_lat, e_up)
+        e_fwd = e_fwd / (np.linalg.norm(e_fwd) + 1e-9)
+
+        neck_vec_3d = pose[0, 0] - pose[0, 1]
+        c_up = np.dot(neck_vec_3d, e_up)
+        c_fwd = np.dot(neck_vec_3d, e_fwd)
+        c_lat = np.dot(neck_vec_3d, e_lat)
+
+        # atan2 is continuous -> no sign-flip discontinuity
+        neck_angle = np.degrees(np.arctan2(c_fwd, c_up))
+        neck_side_angle = abs(np.degrees(np.arctan2(c_lat, c_up)))
+        neck_side = 1 if neck_side_angle > 10.0 else 0
 
         cos_trunk_side = np.dot(trunk_vec_3d, lateral_axis) / (np.linalg.norm(trunk_vec_3d) * np.linalg.norm(lateral_axis) + 1e-9)
         trunk_side_angle = abs(90.0 - np.degrees(np.arccos(np.clip(cos_trunk_side, -1.0, 1.0))))
         trunk_side = 1 if trunk_side_angle > 10.0 else 0
-
-        cos_neck_side = np.dot(neck_vec_3d, lateral_axis) / (np.linalg.norm(neck_vec_3d) * np.linalg.norm(lateral_axis) + 1e-9)
-        neck_side_angle = abs(90.0 - np.degrees(np.arccos(np.clip(cos_neck_side, -1.0, 1.0))))
-        neck_side = 1 if neck_side_angle > 10.0 else 0
 
         step_size = np.linalg.norm(pose[0, 10] - pose[0, 13])
         legs_walking = 1 if step_size > 0.1 else 0
