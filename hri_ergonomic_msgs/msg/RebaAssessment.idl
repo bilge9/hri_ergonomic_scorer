@@ -1,0 +1,76 @@
+// Copyright 2026
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// This IDL defines a REBA (Rapid Entire Body Assessment) ergonomic risk
+// assessment for a single tracked body. It mirrors hri_msgs/Skeleton3D:
+//   - @key string key: same key as the source hri_msgs::msg::Skeleton3D this
+//     assessment was computed from, so a consumer can correlate assessment
+//     <-> body without extra bookkeeping. Supported only by rmw_fastrtps
+//     and Fast DDS.
+//   - std_msgs::msg::Header header: stamp = source skeleton frame's
+//     acquisition time.
+//   - completeness: fraction (0.0-1.0) of the 18 COCO-18 keypoints that had
+//     valid 3D data and were actually used in this assessment.
+//   - score_a/score_b/score_c/risk_level: REBA Table A/B/C scores and the
+//     resulting 5-class risk level.
+//   - group_a_valid/group_b_valid: explicit validity flags so a consumer can
+//     distinguish "score is 0 because risk is negligible" from "score is 0
+//     because we didn't have the joints needed to compute it" -- required
+//     for correctly handling incomplete skeletons.
+
+#include "std_msgs/msg/Header.idl"
+
+module hri_ergonomic_msgs {
+  module msg {
+
+    module RebaAssessment_Constants {
+      const uint8 RISK_NEGLIGIBLE = 0;  // REBA score 1
+      const uint8 RISK_LOW        = 1;  // REBA score 2-3
+      const uint8 RISK_MEDIUM     = 2;  // REBA score 4-7
+      const uint8 RISK_HIGH       = 3;  // REBA score 8-10
+      const uint8 RISK_VERY_HIGH  = 4;  // REBA score 11+
+    };
+
+    struct RebaAssessment {
+      @key string key;
+
+      std_msgs::msg::Header header;
+
+      float completeness;
+
+      uint8 score_a;
+      uint8 score_b;
+      uint8 score_c;
+      uint8 risk_level;
+
+      boolean group_a_valid;
+      boolean group_b_valid;
+      float body_confidence[7];
+      float arm_confidence[7];
+      
+      // Group A (Body) Partial Scores
+      uint8 neck_score;
+      uint8 trunk_score;
+      uint8 leg_score;
+      uint8 load_score;
+
+      // Group B (Arm) Partial Scores
+      uint8 upper_arm_score;
+      uint8 lower_arm_score;
+      uint8 wrist_score;
+      uint8 coupling_score;
+    };
+
+  };
+};

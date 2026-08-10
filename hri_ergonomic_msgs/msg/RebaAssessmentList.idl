@@ -1,0 +1,38 @@
+// Copyright 2026 
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// List of REBA assessments for every body detected in a single frame.
+// Mirrors hri_msgs/Skeleton3DList: same 10-body cap as the source skeleton
+// message (Skeleton3DList is limited to 10 bodies per frame). Use 'key' to
+// correlate an assessment with its source skeleton, not array index --
+// unused slots have an empty key and all-zero fields, exactly like unused
+// slots in Skeleton3DList.
+
+#include "hri_ergonomic_msgs/msg/RebaAssessment.idl"
+#include "std_msgs/msg/Header.idl"
+
+module hri_ergonomic_msgs {
+  module msg {
+
+    typedef hri_ergonomic_msgs::msg::RebaAssessment hri_ergonomic_msgs__msg__RebaAssessment;
+    typedef hri_ergonomic_msgs__msg__RebaAssessment hri_ergonomic_msgs__msg__RebaAssessment__10[10];
+
+    struct RebaAssessmentList {
+      std_msgs::msg::Header header;
+
+      hri_ergonomic_msgs__msg__RebaAssessment__10 assessments;
+    };
+
+  };
+};
