@@ -3,6 +3,71 @@
 
 import numpy as np
 
+# Sentinel published when a REBA term could not be measured at all. Kept here
+# so reba.py, the ROS node and the message consumers agree on a single value.
+# 255 is chosen because every score field in RebaAssessment.idl is a uint8 and
+# no real REBA score can reach it.
+SCORE_NOT_ASSESSED = 255
+
+# rs9000 joint indices used throughout this module:
+#   0 Head, 1 Neck, 2 L_Shoulder, 3 L_Elbow, 4 L_Wrist,
+#   5 R_Shoulder, 6 R_Elbow, 7 R_Wrist,
+#   8 L_Hip, 9 L_Knee, 10 L_Ankle, 11 R_Hip, 12 R_Knee, 13 R_Ankle
+WORLD_UP = np.array([0.0, 1.0, 0.0])
+
+# Vertical ankle separation above which one foot counts as raised. See
+# _body_angles() for why this replaced the old horizontal-distance test.
+FOOT_RAISED_M = 0.15
+
+# Angular tolerances for the "side bending / twisted" REBA modifiers.
+SIDE_BEND_DEG = 10.0
+
+# Dead band around 0 deg of neck flexion. The neck angle comes from atan2, so a
+# physically neutral neck lands on a tiny negative float; without this an
+# anatomically upright neck was scored as extension (2) roughly half the time.
+# Mirrors the 1 deg dead band the trunk item already had.
+NECK_NEUTRAL_DEG = 1.0
+ABDUCTION_DEG = 45.0
+SHOULDER_RAISED_M = 0.02
+
+
+def _unit(v):
+    return v / (np.linalg.norm(v) + 1e-9)
+
+
+def _trunk_frame(pose):
+    """
+    Body-fixed orthonormal frame built by Gram-Schmidt:
+      e_up   along the trunk (mid-hip -> neck)
+      e_lat  across the shoulders, orthogonalised against e_up
+      e_fwd  = e_lat x e_up
+
+    Decomposing a limb vector in this frame separates flexion from lateral
+    bend and, unlike a world-aligned frame, does not depend on how the camera
+    is mounted.
+
+    Returns (trunk_vec, e_up, e_lat, e_fwd, frame_ok). frame_ok is False when
+    the trunk/shoulder joints are missing (zero-filled); callers then get a
+    world-aligned fallback frame so the maths still produces finite numbers,
+    but they can tell the frame is not body-fixed.
+    """
+    mid_hip = (pose[8] + pose[11]) / 2.0
+    trunk_vec = pose[1] - mid_hip
+    lateral_axis = pose[2] - pose[5]
+
+    if np.linalg.norm(trunk_vec) < 1e-6 or np.linalg.norm(lateral_axis) < 1e-6:
+        e_up = WORLD_UP
+        e_lat = np.array([1.0, 0.0, 0.0])
+        e_fwd = np.cross(e_lat, e_up)
+        return trunk_vec, e_up, e_lat, e_fwd, False
+
+    e_up = _unit(trunk_vec)
+    lat_perp = lateral_axis - np.dot(lateral_axis, e_up) * e_up
+    e_lat = _unit(lat_perp)
+    e_fwd = _unit(np.cross(e_lat, e_up))
+    return trunk_vec, e_up, e_lat, e_fwd, True
+
+
 class RebaScore:
     """
     Class to compute REBA metrics.
@@ -14,7 +79,7 @@ class RebaScore:
 
         self.body = {'neck_angle': 0, 'neck_side': False,
                      'trunk_angle': 0, 'trunk_side': False,
-                     'legs_walking': False, 'legs_angle': 0,
+                     'legs_unstable': False, 'legs_angle': 0,
                      'load': 0}
 
         self.arms = {'upper_arm_angle': 0, 'shoulder_raised': False, 'arm_abducted': False, 'leaning': False,
@@ -73,7 +138,7 @@ class RebaScore:
         neck_score, trunk_score, leg_score, load_score = 0, 0, 0, 0
 
         # Neck position score calculation
-        if 0 <= self.body['neck_angle'] <= 20:
+        if -NECK_NEUTRAL_DEG <= self.body['neck_angle'] <= 20:
             neck_score += 1
         else:
             neck_score += 2
@@ -90,8 +155,9 @@ class RebaScore:
             trunk_score += 4
         trunk_score += 1 if self.body['trunk_side'] else 0
 
-        # Legs position score calculation
-        leg_score += 2 if self.body['legs_walking'] else 1
+        # Legs position score calculation. REBA scores 2 when weight is not
+        # borne bilaterally (one leg raised / unstable posture), 1 otherwise.
+        leg_score += 2 if self.body['legs_unstable'] else 1
         if 30 <= self.body['legs_angle'] <= 60:
             leg_score += 1
         elif self.body['legs_angle'] > 60:
@@ -131,6 +197,12 @@ class RebaScore:
 
         upper_arm_score += 1 if self.arms['shoulder_raised'] else 0
         upper_arm_score += 1 if self.arms['arm_abducted'] else 0
+        # NOTE: 'leaning' is REBA's "arm is supported or the person is leaning"
+        # -1 modifier. It cannot be derived from joint positions, so the caller
+        # must supply it (see the arm_supported ROS parameter). It used to be
+        # inferred from trunk flexion > 30 deg, which is wrong twice over:
+        # bending forward does not unload the shoulder, and it fired on exactly
+        # the construction postures that should score highest.
         upper_arm_score -= 1 if self.arms['leaning'] else 0
 
         upper_arm_score = max(1, upper_arm_score)
@@ -171,6 +243,11 @@ class RebaScore:
     def compute_score_c(self, score_a, score_b, activity_score=0):
         """
         Compute final REBA score using Table C and activity score.
+
+        score_a and score_b must be real computed scores (>= 1). Callers that
+        could not measure a whole group must NOT substitute a neutral 1 here -
+        that fabricates "negligible risk" out of missing data. Publish
+        SCORE_NOT_ASSESSED instead.
         """
         reba_scoring = [
             'Negligible Risk',
@@ -179,12 +256,18 @@ class RebaScore:
             'High Risk. Investigate and Implement Change',
             'Very High Risk. Implement Change'
         ]
-        
+
         # Ensure matrix indices are integers
         score_a = int(score_a)
         score_b = int(score_b)
-        
-        score_c = self.table_c[score_a-1][score_b-1]
+
+        if score_a < 1 or score_b < 1:
+            raise ValueError(
+                f"compute_score_c requires measured Table A/B scores, got "
+                f"score_a={score_a}, score_b={score_b}"
+            )
+
+        score_c = self.table_c[min(score_a, 12)-1][min(score_b, 12)-1]
         final_score = score_c + activity_score
         ix = self.score_c_to_5_classes(final_score)
         caption = reba_scoring[ix]
@@ -192,6 +275,8 @@ class RebaScore:
 
     @staticmethod
     def score_c_to_5_classes(score_c):
+        if score_c < 1:
+            raise ValueError(f"REBA score must be >= 1, got {score_c}")
         if score_c == 1: ret = 0
         elif 2 <= score_c <= 3: ret = 1
         elif 4 <= score_c <= 7: ret = 2
@@ -199,209 +284,135 @@ class RebaScore:
         else: ret = 4
         return ret
 
+    # ------------------------------------------------------------------
+    # Geometry -> REBA inputs
+    # ------------------------------------------------------------------
+
     @staticmethod
-    def get_body_angles_from_pose_left(pose, verbose=False):
-        pose = np.expand_dims(np.copy(pose), 0)
+    def _body_angles(pose, hip_idx, knee_idx, ankle_idx):
+        """
+        Group A angles. Only the knee angle depends on which side is passed -
+        neck and trunk are built from joints shared by both sides.
+        """
+        pose = np.asarray(pose, dtype=float)
 
-        mid_hip_3d = (pose[0, 8] + pose[0, 11]) / 2.0
-        trunk_vec_3d = pose[0, 1] - mid_hip_3d
-        vertical_up = np.array([0.0, 1.0, 0.0])
-        
-        cos_trunk = np.dot(trunk_vec_3d, vertical_up) / (np.linalg.norm(trunk_vec_3d) + 1e-9)
-        cos_trunk = np.clip(cos_trunk, -1.0, 1.0)
-        trunk_angle = np.degrees(np.arccos(cos_trunk))
+        trunk_vec, e_up, e_lat, e_fwd, _ = _trunk_frame(pose)
+        lateral_axis = pose[2] - pose[5]
 
-        # --- Body-fixed orthonormal frame (Gram-Schmidt) ---
-        # Decomposing the neck vector in this frame separates flexion from
-        # lateral bend. The previous approach took the full 3D trunk-to-neck
-        # angle and assigned a sign via cross product, which is undefined for
-        # a purely lateral bend and flips ~130 degrees on tiny pose changes.
-        lateral_axis = pose[0, 2] - pose[0, 5]
+        # Trunk flexion is measured against gravity, which is correct: REBA's
+        # trunk item is about the trunk's deviation from upright.
+        trunk_angle = np.degrees(np.arccos(np.clip(np.dot(_unit(trunk_vec), WORLD_UP), -1.0, 1.0)))
 
-        e_up = trunk_vec_3d / (np.linalg.norm(trunk_vec_3d) + 1e-9)
-        lat_perp = lateral_axis - np.dot(lateral_axis, e_up) * e_up
-        e_lat = lat_perp / (np.linalg.norm(lat_perp) + 1e-9)
-        e_fwd = np.cross(e_lat, e_up)
-        e_fwd = e_fwd / (np.linalg.norm(e_fwd) + 1e-9)
-
-        neck_vec_3d = pose[0, 0] - pose[0, 1]
-        c_up = np.dot(neck_vec_3d, e_up)
-        c_fwd = np.dot(neck_vec_3d, e_fwd)
-        c_lat = np.dot(neck_vec_3d, e_lat)
-
-        # atan2 is continuous -> no sign-flip discontinuity
+        # Neck decomposed in the body-fixed frame: atan2 is continuous, so a
+        # purely lateral bend no longer flips the flexion sign by ~130 deg.
+        neck_vec = pose[0] - pose[1]
+        c_up = np.dot(neck_vec, e_up)
+        c_fwd = np.dot(neck_vec, e_fwd)
+        c_lat = np.dot(neck_vec, e_lat)
         neck_angle = np.degrees(np.arctan2(c_fwd, c_up))
-        neck_side_angle = abs(np.degrees(np.arctan2(c_lat, c_up)))
-        neck_side = 1 if neck_side_angle > 10.0 else 0
+        neck_side = 1 if abs(np.degrees(np.arctan2(c_lat, c_up))) > SIDE_BEND_DEG else 0
 
-        cos_trunk_side = np.dot(trunk_vec_3d, lateral_axis) / (np.linalg.norm(trunk_vec_3d) * np.linalg.norm(lateral_axis) + 1e-9)
+        cos_trunk_side = np.dot(_unit(trunk_vec), _unit(lateral_axis))
         trunk_side_angle = abs(90.0 - np.degrees(np.arccos(np.clip(cos_trunk_side, -1.0, 1.0))))
-        trunk_side = 1 if trunk_side_angle > 10.0 else 0
+        trunk_side = 1 if trunk_side_angle > SIDE_BEND_DEG else 0
 
-        step_size = np.linalg.norm(pose[0, 10] - pose[0, 13])
-        legs_walking = 1 if step_size > 0.1 else 0
+        # REBA's legs item is about weight bearing, not travel: score 2 means
+        # one leg raised or an unstable posture. The previous test compared the
+        # HORIZONTAL ankle-to-ankle distance against 0.1 m, so an ordinary
+        # shoulder-width stance (0.20-0.35 m) was flagged as walking on nearly
+        # every frame and inflated Score A by one point. Vertical separation is
+        # what actually distinguishes a raised foot from a normal stance.
+        legs_unstable = 1 if abs(pose[10][1] - pose[13][1]) > FOOT_RAISED_M else 0
 
-        v_thigh = pose[0, 9] - pose[0, 8]
-        v_shin = pose[0, 10] - pose[0, 9]
-        cos_leg = np.dot(v_thigh, v_shin) / (np.linalg.norm(v_thigh) * np.linalg.norm(v_shin) + 1e-9)
-        cos_leg = np.clip(cos_leg, -1.0, 1.0)
+        v_thigh = pose[knee_idx] - pose[hip_idx]
+        v_shin = pose[ankle_idx] - pose[knee_idx]
+        cos_leg = np.clip(np.dot(_unit(v_thigh), _unit(v_shin)), -1.0, 1.0)
         legs_angle = np.degrees(np.arccos(cos_leg))
 
+        # Load is not derivable from geometry; the caller supplies it.
         load = 0
 
-        neck_angle = normalize_angle(neck_angle)
-        trunk_angle = normalize_angle(trunk_angle)
-        legs_angle = normalize_angle(legs_angle)
-        
-        return np.array([neck_angle, neck_side, trunk_angle, trunk_side, legs_walking, legs_angle, load])
+        return np.array([neck_angle, neck_side, trunk_angle, trunk_side,
+                         legs_unstable, legs_angle, load])
+
+    @staticmethod
+    def get_body_angles_from_pose_left(pose, verbose=False):
+        return RebaScore._body_angles(pose, hip_idx=8, knee_idx=9, ankle_idx=10)
 
     @staticmethod
     def get_body_angles_from_pose_right(pose, verbose=False):
-        pose = np.expand_dims(np.copy(pose), 0)
+        return RebaScore._body_angles(pose, hip_idx=11, knee_idx=12, ankle_idx=13)
 
-        mid_hip_3d = (pose[0, 8] + pose[0, 11]) / 2.0
-        trunk_vec_3d = pose[0, 1] - mid_hip_3d
-        vertical_up = np.array([0.0, 1.0, 0.0])
-        
-        cos_trunk = np.dot(trunk_vec_3d, vertical_up) / (np.linalg.norm(trunk_vec_3d) + 1e-9)
-        cos_trunk = np.clip(cos_trunk, -1.0, 1.0)
-        trunk_angle = np.degrees(np.arccos(cos_trunk))
+    @staticmethod
+    def _arm_angles(pose, shoulder_idx, elbow_idx, wrist_idx):
+        """
+        Group B angles for one arm. Side-independent: the flexion sign comes
+        from the body-fixed frame rather than from camera-specific tweaks.
+        """
+        pose = np.asarray(pose, dtype=float)
 
-        lateral_axis = pose[0, 2] - pose[0, 5]
+        v_upper = pose[shoulder_idx] - pose[elbow_idx]
+        v_lower = pose[wrist_idx] - pose[elbow_idx]
+        cos_elbow = np.clip(np.dot(_unit(v_upper), _unit(v_lower)), -1.0, 1.0)
+        lower_arm_angle = 180.0 - np.degrees(np.arccos(cos_elbow))
 
-        e_up = trunk_vec_3d / (np.linalg.norm(trunk_vec_3d) + 1e-9)
-        lat_perp = lateral_axis - np.dot(lateral_axis, e_up) * e_up
-        e_lat = lat_perp / (np.linalg.norm(lat_perp) + 1e-9)
-        e_fwd = np.cross(e_lat, e_up)
-        e_fwd = e_fwd / (np.linalg.norm(e_fwd) + 1e-9)
+        # REBA measures upper arm flexion RELATIVE TO THE TRUNK, not to the
+        # world vertical. Measuring against gravity scored a worker bent 60 deg
+        # forward with arms hanging as 0 deg flexion (upper arm score 1) where
+        # REBA gives 60 deg (score 3) - the largest single source of
+        # under-scoring on construction postures. When the trunk joints are
+        # missing, _trunk_frame falls back to a world-aligned frame, which
+        # degrades to the previous behaviour rather than producing garbage.
+        trunk_vec, e_up, e_lat, e_fwd, _ = _trunk_frame(pose)
 
-        neck_vec_3d = pose[0, 0] - pose[0, 1]
-        c_up = np.dot(neck_vec_3d, e_up)
-        c_fwd = np.dot(neck_vec_3d, e_fwd)
-        c_lat = np.dot(neck_vec_3d, e_lat)
+        arm_vec = pose[elbow_idx] - pose[shoulder_idx]
+        cos_upper = np.clip(np.dot(_unit(arm_vec), e_up), -1.0, 1.0)
+        upper_arm_angle = 180.0 - np.degrees(np.arccos(cos_upper))
 
-        # atan2 is continuous -> no sign-flip discontinuity
-        neck_angle = np.degrees(np.arctan2(c_fwd, c_up))
-        neck_side_angle = abs(np.degrees(np.arctan2(c_lat, c_up)))
-        neck_side = 1 if neck_side_angle > 10.0 else 0
+        # Forward of the trunk plane -> flexion (positive), behind -> extension
+        # (negative). e_fwd follows the same convention as the neck angle
+        # above, so both agree on which way "forward" points. This replaces the
+        # two hand-tuned per-side sign flips that were tied to one camera's
+        # depth orientation.
+        upper_arm_angle *= 1.0 if np.dot(arm_vec, e_fwd) >= 0 else -1.0
 
-        cos_trunk_side = np.dot(trunk_vec_3d, lateral_axis) / (np.linalg.norm(trunk_vec_3d) * np.linalg.norm(lateral_axis) + 1e-9)
-        trunk_side_angle = abs(90.0 - np.degrees(np.arccos(np.clip(cos_trunk_side, -1.0, 1.0))))
-        trunk_side = 1 if trunk_side_angle > 10.0 else 0
+        mid_shoulder_y = (pose[2][1] + pose[5][1]) / 2.0
+        shoulder_raised = 1 if (pose[shoulder_idx][1] - mid_shoulder_y) > SHOULDER_RAISED_M else 0
 
-        step_size = np.linalg.norm(pose[0, 10] - pose[0, 13])
-        legs_walking = 1 if step_size > 0.1 else 0
+        # Abduction: how far the arm swings out along the trunk-orthogonal
+        # lateral axis. A hanging arm is perpendicular to e_lat -> 0 deg.
+        cos_abduct = np.clip(np.dot(_unit(arm_vec), e_lat), -1.0, 1.0)
+        abduct_angle = abs(90.0 - np.degrees(np.arccos(cos_abduct)))
+        arm_abducted = 1 if abduct_angle > ABDUCTION_DEG else 0
 
-        v_thigh = pose[0, 12] - pose[0, 11]
-        v_shin = pose[0, 13] - pose[0, 12]
-        cos_leg = np.dot(v_thigh, v_shin) / (np.linalg.norm(v_thigh) * np.linalg.norm(v_shin) + 1e-9)
-        cos_leg = np.clip(cos_leg, -1.0, 1.0)
-        legs_angle = np.degrees(np.arccos(cos_leg))
+        # 'leaning' (arm supported / person leaning) and the wrist terms are
+        # not observable from a COCO-18 skeleton. They are returned as 0 and
+        # must be overridden by the caller if a real source exists; the node
+        # publishes *_assessed flags so consumers can tell "0 because good"
+        # from "0 because never measured".
+        leaning = 0
+        wrist_angle = 0
+        wrist_twisted = 0
 
-        load = 0
-
-        neck_angle = normalize_angle(neck_angle)
-        trunk_angle = normalize_angle(trunk_angle)
-        legs_angle = normalize_angle(legs_angle)
-        
-        return np.array([neck_angle, neck_side, trunk_angle, trunk_side, legs_walking, legs_angle, load])
+        return np.array([upper_arm_angle, shoulder_raised, arm_abducted, leaning,
+                         lower_arm_angle, wrist_angle, wrist_twisted])
 
     @staticmethod
     def get_arms_angles_from_pose_left(pose, verbose=False):
-        pose = np.expand_dims(np.copy(pose), 0)
-
-        v_upper_3d = pose[0, 2] - pose[0, 3]
-        v_lower_3d = pose[0, 4] - pose[0, 3]
-        cos_elbow = np.dot(v_upper_3d, v_lower_3d) / (np.linalg.norm(v_upper_3d) * np.linalg.norm(v_lower_3d) + 1e-9)
-        cos_elbow = np.clip(cos_elbow, -1.0, 1.0)
-        true_lower_arm_angle = 180.0 - np.degrees(np.arccos(cos_elbow))
-
-        arm_vec_3d = pose[0, 3] - pose[0, 2]
-        vertical_down = np.array([0.0, 1.0, 0.0])
-        
-        cos_upper = np.dot(arm_vec_3d, vertical_down) / (np.linalg.norm(arm_vec_3d) + 1e-9)
-        cos_upper = np.clip(cos_upper, -1.0, 1.0)
-        true_upper_arm_angle = 180.0 - np.degrees(np.arccos(cos_upper))
-
-        lateral_axis = pose[0, 2] - pose[0, 5]
-        upper_arm_sign_vec = np.cross(vertical_down, arm_vec_3d)
-        
-        # FIX: Flipped < to >= for correct ZED depth orientation
-        upper_arm_sign = 1.0 if np.dot(upper_arm_sign_vec, lateral_axis) >= 0 else -1.0
-        true_upper_arm_angle = upper_arm_sign * true_upper_arm_angle
-
-        mid_shoulder_y = (pose[0, 2, 1] + pose[0, 5, 1]) / 2.0
-        shoulder_raised = 1 if (pose[0, 2, 1] - mid_shoulder_y) > 0.02 else 0
-
-        cos_abduct = np.dot(arm_vec_3d, lateral_axis) / (np.linalg.norm(arm_vec_3d) * np.linalg.norm(lateral_axis) + 1e-9)
-        abduct_angle = abs(90.0 - np.degrees(np.arccos(np.clip(cos_abduct, -1.0, 1.0))))
-        arm_abducted = 1 if abduct_angle > 45.0 else 0
-
-        mid_hip_3d = (pose[0, 8] + pose[0, 11]) / 2.0
-        trunk_vec_3d = pose[0, 1] - mid_hip_3d
-        vertical_up = np.array([0.0, 1.0, 0.0])
-        cos_trunk = np.dot(trunk_vec_3d, vertical_up) / (np.linalg.norm(trunk_vec_3d) + 1e-9)
-        trunk_angle = np.degrees(np.arccos(np.clip(cos_trunk, -1.0, 1.0)))
-        leaning = 1 if trunk_angle > 30.0 else 0
-
-        lower_arm_angle = true_lower_arm_angle
-        wrist_angle = 0
-        wrist_twisted = 0
-        upper_arm_angle = true_upper_arm_angle
-
-        upper_arm_angle = normalize_angle(upper_arm_angle)
-        lower_arm_angle = normalize_angle(lower_arm_angle)
-        wrist_angle = normalize_angle(wrist_angle)
-
-        return np.array([upper_arm_angle, shoulder_raised, arm_abducted, leaning, lower_arm_angle, wrist_angle, wrist_twisted])
+        return RebaScore._arm_angles(pose, shoulder_idx=2, elbow_idx=3, wrist_idx=4)
 
     @staticmethod
     def get_arms_angles_from_pose_right(pose, verbose=False):
-        pose = np.expand_dims(np.copy(pose), 0)
+        return RebaScore._arm_angles(pose, shoulder_idx=5, elbow_idx=6, wrist_idx=7)
 
-        v_upper_3d = pose[0, 5] - pose[0, 6]
-        v_lower_3d = pose[0, 7] - pose[0, 6]
-        cos_elbow = np.dot(v_upper_3d, v_lower_3d) / (np.linalg.norm(v_upper_3d) * np.linalg.norm(v_lower_3d) + 1e-9)
-        cos_elbow = np.clip(cos_elbow, -1.0, 1.0)
-        true_lower_arm_angle = 180.0 - np.degrees(np.arccos(cos_elbow))
-
-        arm_vec_3d = pose[0, 6] - pose[0, 5]
-        vertical_down = np.array([0.0, 1.0, 0.0])
-        
-        cos_upper = np.dot(arm_vec_3d, vertical_down) / (np.linalg.norm(arm_vec_3d) + 1e-9)
-        cos_upper = np.clip(cos_upper, -1.0, 1.0)
-        true_upper_arm_angle = 180.0 - np.degrees(np.arccos(cos_upper))
-
-        lateral_axis = pose[0, 2] - pose[0, 5]
-        upper_arm_sign_vec = np.cross(vertical_down, arm_vec_3d)
-        
-        # FIX: Flipped >= to < for correct ZED depth orientation on the right arm
-        upper_arm_sign = 1.0 if np.dot(upper_arm_sign_vec, lateral_axis) < 0 else -1.0
-        true_upper_arm_angle = upper_arm_sign * true_upper_arm_angle
-
-        mid_shoulder_y = (pose[0, 2, 1] + pose[0, 5, 1]) / 2.0
-        shoulder_raised = 1 if (pose[0, 5, 1] - mid_shoulder_y) > 0.02 else 0
-
-        cos_abduct = np.dot(arm_vec_3d, lateral_axis) / (np.linalg.norm(arm_vec_3d) * np.linalg.norm(lateral_axis) + 1e-9)
-        abduct_angle = abs(90.0 - np.degrees(np.arccos(np.clip(cos_abduct, -1.0, 1.0))))
-        arm_abducted = 1 if abduct_angle > 45.0 else 0
-
-        mid_hip_3d = (pose[0, 8] + pose[0, 11]) / 2.0
-        trunk_vec_3d = pose[0, 1] - mid_hip_3d
-        vertical_up = np.array([0.0, 1.0, 0.0])
-        cos_trunk = np.dot(trunk_vec_3d, vertical_up) / (np.linalg.norm(trunk_vec_3d) + 1e-9)
-        trunk_angle = np.degrees(np.arccos(np.clip(cos_trunk, -1.0, 1.0)))
-        leaning = 1 if trunk_angle > 30.0 else 0
-
-        lower_arm_angle = true_lower_arm_angle
-        wrist_angle = 0
-        wrist_twisted = 0
-        upper_arm_angle = true_upper_arm_angle
-
-        upper_arm_angle = normalize_angle(upper_arm_angle)
-        lower_arm_angle = normalize_angle(lower_arm_angle)
-        wrist_angle = normalize_angle(wrist_angle)
-        return np.array([upper_arm_angle, shoulder_raised, arm_abducted, leaning, lower_arm_angle, wrist_angle, wrist_twisted])
 
 def normalize_angle(angle):
+    """
+    Wrap an angle into (-180, 180].
+
+    No longer applied to the pose->angle results: arccos already returns
+    [0, 180] and atan2 returns (-180, 180], so wrapping was a no-op except at
+    exactly 180 deg, where it flipped a fully inverted trunk to -180 and made
+    compute_score_a() read it as a 2 instead of a 4.
+    """
     return ((angle + 180) % 360) - 180

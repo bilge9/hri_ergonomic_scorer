@@ -3,14 +3,41 @@
 <package format="3">
   <name>hri_ergonomic_scorer</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>
+    REBA- and DEBA-inspired ergonomic risk assessment for Vulcanexus HRI.
+    Subscribes to hri_msgs/Skeleton3DList 3D skeleton tracking, scores the
+    posture even when the skeleton is incomplete, and publishes the result as
+    hri_ergonomic_msgs/RebaAssessmentList.
+  </description>
   <maintainer email="bilgenurdemirel49@gmail.com">bilge</maintainer>
-  <license>TODO: License declaration</license>
+  <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
   <depend>hri_msgs</depend>
   <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <!-- The custom REBA messages this node publishes. Without this, colcon has
+       no reason to build hri_ergonomic_msgs first and a clean workspace
+       build fails on the import. -->
+  <depend>hri_ergonomic_msgs</depend>
+  <depend>ament_index_python</depend>
 
+  <exec_depend>python3-numpy</exec_depend>
+  <!-- DEBA inference. If this rosdep key is unavailable on your platform,
+       install torch into the environment manually; the node degrades to
+       REBA-only rather than failing to start. -->
+  <exec_depend>python3-torch</exec_depend>
+  <!-- Skeleton overlay node -->
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <!-- FIWARE / Orion-LD bridge -->
+  <exec_depend>python3-requests</exec_depend>
+  <!-- Launch file -->
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <!-- Dataset generation / model training only (not needed at runtime) -->
+  <test_depend>python3-scipy</test_depend>
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
