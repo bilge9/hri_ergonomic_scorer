@@ -35,10 +35,43 @@ def _unit(v):
     return v / (np.linalg.norm(v) + 1e-9)
 
 
-def _trunk_frame(pose):
+class TrunkFrame:
     """
-    Body-fixed orthonormal frame built by Gram-Schmidt:
-      e_up   along the trunk (mid-hip -> neck)
+    Body-fixed orthonormal frame plus a record of how well it is supported.
+
+    hips_exact / shoulders_exact are False when the frame had to be built from
+    a single hip or a single shoulder. The frame is still usable - a one-hip
+    trunk vector measures sagittal flexion perfectly well - but the LATERAL
+    terms derived from it (trunk side bend, neck side bend) are not
+    trustworthy, because a single hip displaces the trunk base sideways by
+    half a pelvis width and fakes ~10 deg of lean.
+    """
+    __slots__ = ('trunk_vec', 'e_up', 'e_lat', 'e_fwd', 'lateral_raw', 'ok',
+                 'hips_exact', 'shoulders_exact')
+
+    def __init__(self, trunk_vec, e_up, e_lat, e_fwd, ok,
+                 hips_exact, shoulders_exact, lateral_raw=None):
+        self.trunk_vec = trunk_vec
+        self.e_up = e_up
+        self.e_lat = e_lat
+        self.e_fwd = e_fwd
+        # The shoulder line BEFORE orthogonalisation. e_lat is perpendicular to
+        # e_up by construction, so it cannot measure how far the trunk leans
+        # away from the shoulder line - only the raw axis can.
+        self.lateral_raw = lateral_raw if lateral_raw is not None else e_lat
+        self.ok = ok
+        self.hips_exact = hips_exact
+        self.shoulders_exact = shoulders_exact
+
+    @property
+    def lateral_ok(self):
+        return self.ok and self.hips_exact and self.shoulders_exact
+
+
+def _trunk_frame(pose, valid=None):
+    """
+    Build the body-fixed frame:
+      e_up   along the trunk (hip reference -> neck)
       e_lat  across the shoulders, orthogonalised against e_up
       e_fwd  = e_lat x e_up
 
@@ -46,26 +79,62 @@ def _trunk_frame(pose):
     bend and, unlike a world-aligned frame, does not depend on how the camera
     is mounted.
 
-    Returns (trunk_vec, e_up, e_lat, e_fwd, frame_ok). frame_ok is False when
-    the trunk/shoulder joints are missing (zero-filled); callers then get a
-    world-aligned fallback frame so the maths still produces finite numbers,
-    but they can tell the frame is not body-fixed.
-    """
-    mid_hip = (pose[8] + pose[11]) / 2.0
-    trunk_vec = pose[1] - mid_hip
-    lateral_axis = pose[2] - pose[5]
+    Missing joints degrade the frame instead of destroying it. A worker seen
+    side-on loses one hip and one shoulder, which is the most common situation
+    on a construction site; requiring both would declare the trunk
+    unmeasurable and leave the scorer substituting an upright trunk for
+    someone who may be bent double. One hip still fixes the trunk axis and one
+    shoulder still fixes the lateral direction (via the neck), so those
+    fallbacks are used and flagged rather than refused.
 
-    if np.linalg.norm(trunk_vec) < 1e-6 or np.linalg.norm(lateral_axis) < 1e-6:
-        e_up = WORLD_UP
-        e_lat = np.array([1.0, 0.0, 0.0])
-        e_fwd = np.cross(e_lat, e_up)
-        return trunk_vec, e_up, e_lat, e_fwd, False
+    valid: optional (14,) bool array in rs9000 index space. None = all valid.
+    """
+    if valid is None:
+        valid = np.ones(len(pose), dtype=bool)
+
+    world_frame = (np.zeros(3), WORLD_UP, np.array([1.0, 0.0, 0.0]),
+                   np.cross(np.array([1.0, 0.0, 0.0]), WORLD_UP))
+
+    if not valid[1]:
+        return TrunkFrame(*world_frame, False, False, False)
+
+    # --- hip reference ---
+    hips_exact = bool(valid[8] and valid[11])
+    if hips_exact:
+        hip_ref = (pose[8] + pose[11]) / 2.0
+    elif valid[8]:
+        hip_ref = pose[8]
+    elif valid[11]:
+        hip_ref = pose[11]
+    else:
+        return TrunkFrame(*world_frame, False, False, False)
+
+    trunk_vec = pose[1] - hip_ref
+    if np.linalg.norm(trunk_vec) < 1e-6:
+        return TrunkFrame(*world_frame, False, False, False)
+
+    # --- lateral axis, pointing from the right shoulder toward the left ---
+    shoulders_exact = bool(valid[2] and valid[5])
+    if shoulders_exact:
+        lateral_axis = pose[2] - pose[5]
+    elif valid[2]:
+        lateral_axis = 2.0 * (pose[2] - pose[1])      # neck -> left shoulder
+    elif valid[5]:
+        lateral_axis = 2.0 * (pose[1] - pose[5])      # right shoulder -> neck
+    else:
+        return TrunkFrame(trunk_vec, _unit(trunk_vec), world_frame[2],
+                          world_frame[3], False, hips_exact, False)
 
     e_up = _unit(trunk_vec)
     lat_perp = lateral_axis - np.dot(lateral_axis, e_up) * e_up
+    if np.linalg.norm(lat_perp) < 1e-6:
+        return TrunkFrame(trunk_vec, e_up, world_frame[2], world_frame[3],
+                          False, hips_exact, shoulders_exact)
+
     e_lat = _unit(lat_perp)
     e_fwd = _unit(np.cross(e_lat, e_up))
-    return trunk_vec, e_up, e_lat, e_fwd, True
+    return TrunkFrame(trunk_vec, e_up, e_lat, e_fwd, True,
+                      hips_exact, shoulders_exact, lateral_raw=lateral_axis)
 
 
 class RebaScore:
@@ -289,15 +358,15 @@ class RebaScore:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _body_angles(pose, hip_idx, knee_idx, ankle_idx):
+    def _body_angles(pose, hip_idx, knee_idx, ankle_idx, valid=None):
         """
         Group A angles. Only the knee angle depends on which side is passed -
         neck and trunk are built from joints shared by both sides.
         """
         pose = np.asarray(pose, dtype=float)
-
-        trunk_vec, e_up, e_lat, e_fwd, _ = _trunk_frame(pose)
-        lateral_axis = pose[2] - pose[5]
+        frame = _trunk_frame(pose, valid)
+        e_up, e_lat, e_fwd = frame.e_up, frame.e_lat, frame.e_fwd
+        trunk_vec = frame.trunk_vec
 
         # Trunk flexion is measured against gravity, which is correct: REBA's
         # trunk item is about the trunk's deviation from upright.
@@ -310,11 +379,19 @@ class RebaScore:
         c_fwd = np.dot(neck_vec, e_fwd)
         c_lat = np.dot(neck_vec, e_lat)
         neck_angle = np.degrees(np.arctan2(c_fwd, c_up))
-        neck_side = 1 if abs(np.degrees(np.arctan2(c_lat, c_up))) > SIDE_BEND_DEG else 0
 
-        cos_trunk_side = np.dot(_unit(trunk_vec), _unit(lateral_axis))
-        trunk_side_angle = abs(90.0 - np.degrees(np.arccos(np.clip(cos_trunk_side, -1.0, 1.0))))
-        trunk_side = 1 if trunk_side_angle > SIDE_BEND_DEG else 0
+        # The lateral REBA terms are only reported when the frame actually has
+        # both hips and both shoulders behind it. From a single hip the trunk
+        # base is displaced sideways by half a pelvis width, which fabricates
+        # ~10 deg of lean - right at the side-bend threshold.
+        if frame.lateral_ok:
+            neck_side = 1 if abs(np.degrees(np.arctan2(c_lat, c_up))) > SIDE_BEND_DEG else 0
+            cos_trunk_side = np.dot(_unit(trunk_vec), _unit(frame.lateral_raw))
+            trunk_side_angle = abs(90.0 - np.degrees(np.arccos(np.clip(cos_trunk_side, -1.0, 1.0))))
+            trunk_side = 1 if trunk_side_angle > SIDE_BEND_DEG else 0
+        else:
+            neck_side = 0
+            trunk_side = 0
 
         # REBA's legs item is about weight bearing, not travel: score 2 means
         # one leg raised or an unstable posture. The previous test compared the
@@ -336,15 +413,15 @@ class RebaScore:
                          legs_unstable, legs_angle, load])
 
     @staticmethod
-    def get_body_angles_from_pose_left(pose, verbose=False):
-        return RebaScore._body_angles(pose, hip_idx=8, knee_idx=9, ankle_idx=10)
+    def get_body_angles_from_pose_left(pose, verbose=False, valid=None):
+        return RebaScore._body_angles(pose, hip_idx=8, knee_idx=9, ankle_idx=10, valid=valid)
 
     @staticmethod
-    def get_body_angles_from_pose_right(pose, verbose=False):
-        return RebaScore._body_angles(pose, hip_idx=11, knee_idx=12, ankle_idx=13)
+    def get_body_angles_from_pose_right(pose, verbose=False, valid=None):
+        return RebaScore._body_angles(pose, hip_idx=11, knee_idx=12, ankle_idx=13, valid=valid)
 
     @staticmethod
-    def _arm_angles(pose, shoulder_idx, elbow_idx, wrist_idx):
+    def _arm_angles(pose, shoulder_idx, elbow_idx, wrist_idx, valid=None):
         """
         Group B angles for one arm. Side-independent: the flexion sign comes
         from the body-fixed frame rather than from camera-specific tweaks.
@@ -363,7 +440,8 @@ class RebaScore:
         # under-scoring on construction postures. When the trunk joints are
         # missing, _trunk_frame falls back to a world-aligned frame, which
         # degrades to the previous behaviour rather than producing garbage.
-        trunk_vec, e_up, e_lat, e_fwd, _ = _trunk_frame(pose)
+        frame = _trunk_frame(pose, valid)
+        e_up, e_lat, e_fwd = frame.e_up, frame.e_lat, frame.e_fwd
 
         arm_vec = pose[elbow_idx] - pose[shoulder_idx]
         cos_upper = np.clip(np.dot(_unit(arm_vec), e_up), -1.0, 1.0)
@@ -376,8 +454,12 @@ class RebaScore:
         # depth orientation.
         upper_arm_angle *= 1.0 if np.dot(arm_vec, e_fwd) >= 0 else -1.0
 
-        mid_shoulder_y = (pose[2][1] + pose[5][1]) / 2.0
-        shoulder_raised = 1 if (pose[shoulder_idx][1] - mid_shoulder_y) > SHOULDER_RAISED_M else 0
+        # Needs both shoulders by definition - it is an asymmetry measure.
+        if frame.shoulders_exact:
+            mid_shoulder_y = (pose[2][1] + pose[5][1]) / 2.0
+            shoulder_raised = 1 if (pose[shoulder_idx][1] - mid_shoulder_y) > SHOULDER_RAISED_M else 0
+        else:
+            shoulder_raised = 0
 
         # Abduction: how far the arm swings out along the trunk-orthogonal
         # lateral axis. A hanging arm is perpendicular to e_lat -> 0 deg.
@@ -398,12 +480,12 @@ class RebaScore:
                          lower_arm_angle, wrist_angle, wrist_twisted])
 
     @staticmethod
-    def get_arms_angles_from_pose_left(pose, verbose=False):
-        return RebaScore._arm_angles(pose, shoulder_idx=2, elbow_idx=3, wrist_idx=4)
+    def get_arms_angles_from_pose_left(pose, verbose=False, valid=None):
+        return RebaScore._arm_angles(pose, shoulder_idx=2, elbow_idx=3, wrist_idx=4, valid=valid)
 
     @staticmethod
-    def get_arms_angles_from_pose_right(pose, verbose=False):
-        return RebaScore._arm_angles(pose, shoulder_idx=5, elbow_idx=6, wrist_idx=7)
+    def get_arms_angles_from_pose_right(pose, verbose=False, valid=None):
+        return RebaScore._arm_angles(pose, shoulder_idx=5, elbow_idx=6, wrist_idx=7, valid=valid)
 
 
 def normalize_angle(angle):

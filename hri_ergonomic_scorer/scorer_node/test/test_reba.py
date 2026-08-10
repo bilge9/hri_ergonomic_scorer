@@ -180,6 +180,81 @@ def test_sentinel_is_out_of_band():
     assert SCORE_NOT_ASSESSED > 15
 
 
+# ----------------------------------- profile poses / degraded trunk frame
+
+def _valid_all():
+    return np.ones(14, dtype=bool)
+
+
+def test_single_hip_still_measures_trunk_flexion():
+    """
+    Side-on workers lose one hip. Requiring both declared the trunk
+    unmeasurable, and the scorer then substituted an upright trunk for
+    someone who could be bent double.
+    """
+    pose = make_pose(trunk_flex_deg=60.0, arms_along_gravity=True)
+    valid = _valid_all()
+    valid[11] = False   # right hip occluded
+
+    both = RebaScore.get_body_angles_from_pose_left(pose)
+    one = RebaScore.get_body_angles_from_pose_left(pose, valid=valid)
+
+    assert one[2] == pytest.approx(both[2], abs=8.0), \
+        "one-hip trunk flexion must stay close to the two-hip value"
+    assert one[2] > 45.0, "a 60 deg bend must not read as upright"
+
+
+def test_lateral_terms_suppressed_when_the_frame_is_one_sided():
+    """
+    A single hip displaces the trunk base by half a pelvis width, which fakes
+    ~10 deg of lean - right at the side-bend threshold. The lateral items must
+    not be reported from such a frame.
+    """
+    pose = make_pose(trunk_flex_deg=20.0)
+    valid = _valid_all()
+    valid[11] = False
+
+    angles = RebaScore.get_body_angles_from_pose_left(pose, valid=valid)
+    assert angles[1] == 0, "neck side bend must not be claimed from one hip"
+    assert angles[3] == 0, "trunk side bend must not be claimed from one hip"
+
+
+def test_single_shoulder_still_measures_upper_arm():
+    pose = make_pose(trunk_flex_deg=60.0, arms_along_gravity=True)
+    valid = _valid_all()
+    valid[5] = False    # right shoulder occluded; left arm still visible
+
+    arm = RebaScore.get_arms_angles_from_pose_left(pose, valid=valid)
+    assert arm[0] == pytest.approx(60.0, abs=5.0)
+
+
+def test_profile_pose_reaches_a_trunk_score():
+    """The whole point: a side-on worker must still be assessable."""
+    from pose_remap import reba_inputs_are_sufficient
+
+    reba_valid = _valid_all()
+    for idx in (5, 6, 7, 11, 12, 13):   # right shoulder/arm and right leg gone
+        reba_valid[idx] = False
+
+    readiness = reba_inputs_are_sufficient(reba_valid)
+    assert readiness['trunk_ok'], "profile pose must still yield a trunk score"
+    assert readiness['neck_ok']
+    assert readiness['left_leg_ok']
+    assert readiness['left_arm_ok']
+    assert not readiness['mid_hip_exact']
+    assert not readiness['shoulder_axis_exact']
+
+
+def test_no_hip_at_all_is_still_refused():
+    from pose_remap import reba_inputs_are_sufficient
+
+    reba_valid = _valid_all()
+    reba_valid[8] = reba_valid[11] = False
+    readiness = reba_inputs_are_sufficient(reba_valid)
+    assert not readiness['trunk_ok']
+    assert not readiness['neck_ok']
+
+
 # ------------------------------------------------------- table integrity
 
 def test_table_c_indices_cover_the_full_modifier_range():
