@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import math
 import requests
 import json
 from datetime import datetime, timezone
@@ -14,6 +15,10 @@ HEADERS = {
     "Link": f'<{CORE_CONTEXT}>; rel="http://www.w3.org/ns/json-ld#context"; type="application/ld+json"'
 }
 REBA_TOPIC = "/humans/bodies/ergonomics/reba"
+
+# Must match RebaAssessment_Constants in the IDL.
+SCORE_NOT_ASSESSED = 255
+RISK_UNKNOWN = 255
 
 
 class FiwareRebaBridgeNode(Node):
@@ -36,128 +41,89 @@ class FiwareRebaBridgeNode(Node):
         dt = datetime.fromtimestamp(sec + nanosec / 1e9, tz=timezone.utc)
         return dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
+    @staticmethod
+    def _prop(value, timestamp):
+        return {"type": "Property", "value": value, "observedAt": timestamp}
+
+    def build_payload(self, assessment, timestamp):
+        """
+        Build the NGSI-LD attribute set for one assessment.
+
+        Scores whose underlying item was never observed are OMITTED, not sent
+        as their neutral value. Writing them anyway is what let a fully
+        occluded body show up in Grafana as a solid "negligible risk" reading:
+        Orion has no way to tell a measured 1 from a fabricated one.
+        """
+        payload = {
+            "completeness": self._prop(float(assessment.completeness), timestamp),
+            "groupAValid": self._prop(bool(assessment.group_a_valid), timestamp),
+            "groupBValid": self._prop(bool(assessment.group_b_valid), timestamp),
+            "scoreIsLowerBound": self._prop(bool(assessment.score_is_lower_bound), timestamp),
+        }
+
+        def add_score(name, value, assessed=True):
+            if assessed and int(value) != SCORE_NOT_ASSESSED:
+                payload[name] = self._prop(int(value), timestamp)
+
+        # --- Final score and risk level ---
+        add_score("scoreA", assessment.score_a, assessment.group_a_valid)
+        add_score("scoreB", assessment.score_b, assessment.group_b_valid)
+        if int(assessment.score_c) != SCORE_NOT_ASSESSED:
+            payload["scoreC"] = self._prop(int(assessment.score_c), timestamp)
+        if int(assessment.risk_level) != RISK_UNKNOWN:
+            payload["riskLevel"] = self._prop(int(assessment.risk_level), timestamp)
+
+        # --- Per-region REBA breakdown (Group A: body) ---
+        add_score("neckScore", assessment.neck_score, assessment.neck_assessed)
+        add_score("trunkScore", assessment.trunk_score, assessment.trunk_assessed)
+        add_score("legScore", assessment.leg_score, assessment.legs_assessed)
+        add_score("loadScore", assessment.load_score, assessment.load_known)
+
+        # --- Per-region REBA breakdown (Group B: arm) ---
+        add_score("upperArmScore", assessment.upper_arm_score, assessment.upper_arm_assessed)
+        add_score("lowerArmScore", assessment.lower_arm_score, assessment.lower_arm_assessed)
+        add_score("wristScore", assessment.wrist_score, assessment.wrist_assessed)
+        add_score("couplingScore", assessment.coupling_score, assessment.coupling_known)
+
+        # --- Observation flags, so a dashboard can render "not measured"
+        #     differently from "measured and fine" ---
+        payload["neckAssessed"] = self._prop(bool(assessment.neck_assessed), timestamp)
+        payload["trunkAssessed"] = self._prop(bool(assessment.trunk_assessed), timestamp)
+        payload["legsAssessed"] = self._prop(bool(assessment.legs_assessed), timestamp)
+        payload["upperArmAssessed"] = self._prop(bool(assessment.upper_arm_assessed), timestamp)
+        payload["lowerArmAssessed"] = self._prop(bool(assessment.lower_arm_assessed), timestamp)
+        payload["wristAssessed"] = self._prop(bool(assessment.wrist_assessed), timestamp)
+
+        # --- DEBA ---
+        payload["debaValid"] = self._prop(bool(assessment.deba_valid), timestamp)
+        if assessment.deba_valid and not math.isnan(assessment.deba_score):
+            payload["debaScore"] = self._prop(float(assessment.deba_score), timestamp)
+
+        # --- Confidence readouts (0 means the region backed no computation) ---
+        for name, value in (
+            ("neckConfidence", assessment.body_confidence[0]),
+            ("trunkConfidence", assessment.body_confidence[2]),
+            ("legConfidence", assessment.body_confidence[4]),
+            ("upperArmConfidence", assessment.arm_confidence[0]),
+            ("lowerArmConfidence", assessment.arm_confidence[4]),
+        ):
+            if value > 0.0:
+                payload[name] = self._prop(float(value), timestamp)
+
+        return payload
+
     def send_to_orion_ld(self, assessment, timestamp):
         """Send a single valid ergonomic assessment to Orion-LD."""
         entity_id = f"urn:ngsi-ld:ErgonomicAssessment:v2:{assessment.key}"
-
-        # NGSI-LD PATCH payload containing all REBA assessment attributes
-        patch_payload = {
-            "completeness": {
-                "type": "Property",
-                "value": float(assessment.completeness),
-                "observedAt": timestamp
-            },
-            "debaScore": {
-                "type": "Property",
-                "value": float(assessment.deba_score),
-                "observedAt": timestamp
-            },
-            "scoreA": {
-                "type": "Property",
-                "value": int(assessment.score_a),
-                "observedAt": timestamp
-            },
-            "scoreB": {
-                "type": "Property",
-                "value": int(assessment.score_b),
-                "observedAt": timestamp
-            },
-            "scoreC": {
-                "type": "Property",
-                "value": int(assessment.score_c),
-                "observedAt": timestamp
-            },
-            "riskLevel": {
-                "type": "Property",
-                "value": int(assessment.risk_level),
-                "observedAt": timestamp
-            },
-            "groupAValid": {
-                "type": "Property",
-                "value": bool(assessment.group_a_valid),
-                "observedAt": timestamp
-            },
-            "groupBValid": {
-                "type": "Property",
-                "value": bool(assessment.group_b_valid),
-                "observedAt": timestamp
-            },
-            # --- Per-region REBA breakdown (Group A: body) ---
-            "neckScore": {
-                "type": "Property",
-                "value": int(assessment.neck_score),
-                "observedAt": timestamp
-            },
-            "trunkScore": {
-                "type": "Property",
-                "value": int(assessment.trunk_score),
-                "observedAt": timestamp
-            },
-            "legScore": {
-                "type": "Property",
-                "value": int(assessment.leg_score),
-                "observedAt": timestamp
-            },
-            "loadScore": {
-                "type": "Property",
-                "value": int(assessment.load_score),
-                "observedAt": timestamp
-            },
-            # --- Per-region REBA breakdown (Group B: arm) ---
-            "upperArmScore": {
-                "type": "Property",
-                "value": int(assessment.upper_arm_score),
-                "observedAt": timestamp
-            },
-            "lowerArmScore": {
-                "type": "Property",
-                "value": int(assessment.lower_arm_score),
-                "observedAt": timestamp
-            },
-            "wristScore": {
-                "type": "Property",
-                "value": int(assessment.wrist_score),
-                "observedAt": timestamp
-            },
-            "couplingScore": {
-                "type": "Property",
-                "value": int(assessment.coupling_score),
-                "observedAt": timestamp
-            },
-            "neckConfidence": {
-                "type": "Property",
-                "value": float(assessment.body_confidence[0]),
-                "observedAt": timestamp
-            },
-            "trunkConfidence": {
-                "type": "Property",
-                "value": float(assessment.body_confidence[2]),
-                "observedAt": timestamp
-            },
-            "legConfidence": {
-                "type": "Property",
-                "value": float(assessment.body_confidence[4]),
-                "observedAt": timestamp
-            },
-            "upperArmConfidence": {
-                "type": "Property",
-                "value": float(assessment.arm_confidence[0]),
-                "observedAt": timestamp
-            },
-            "lowerArmConfidence": {
-                "type": "Property",
-                "value": float(assessment.arm_confidence[4]),
-                "observedAt": timestamp
-            },
-        }
-
+        patch_payload = self.build_payload(assessment, timestamp)
         patch_url = f"{ORION_LD_URL}/{entity_id}/attrs"
 
         try:
             response = requests.post(
                 patch_url,
                 data=json.dumps(patch_payload),
-                headers=HEADERS
+                headers=HEADERS,
+                timeout=2.0
             )
 
             # If the entity does not exist yet, create it with a POST request
@@ -171,11 +137,12 @@ class FiwareRebaBridgeNode(Node):
                 response = requests.post(
                     ORION_LD_URL,
                     data=json.dumps(create_payload),
-                    headers=HEADERS
+                    headers=HEADERS,
+                    timeout=2.0
                 )
 
                 self.get_logger().info(f"Created new entity: {entity_id}")
-                
+
             elif response.status_code not in [200, 201, 204]:
                 self.get_logger().warn(f"Orion response: {response.status_code} - {response.text}")
 
@@ -184,14 +151,11 @@ class FiwareRebaBridgeNode(Node):
 
     def reba_callback(self, msg):
         """Process all REBA assessments received in the RebaAssessmentList message."""
-        
         timestamp = self.get_iso_time_from_header(msg.header)
 
         for assessment in msg.assessments:
             if not assessment.key:
                 continue
-            
-            # Doğru zaman damgasını fonksiyona parametre olarak ilet
             self.send_to_orion_ld(assessment, timestamp)
 
 
@@ -205,7 +169,10 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

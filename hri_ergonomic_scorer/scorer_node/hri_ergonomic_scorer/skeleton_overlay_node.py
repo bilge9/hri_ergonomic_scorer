@@ -20,6 +20,8 @@ from sensor_msgs.msg import Image, CameraInfo
 from hri_msgs.msg import Skeleton3DList
 from hri_ergonomic_msgs.msg import RebaAssessmentList
 
+from .reba import SCORE_NOT_ASSESSED
+
 # --- COCO-18 joint order ---
 JOINT_NAMES = [
     "Nose", "Neck", "R_Shoulder", "R_Elbow", "R_Wrist",
@@ -78,17 +80,27 @@ REGION_THRESHOLDS = {
 }
 
 def color_for_region(score, region):
-    if score is None or score == 0:
+    # SCORE_NOT_ASSESSED means the region was never observed. Painting it green
+    # like a genuinely good posture is exactly the failure this sentinel exists
+    # to prevent, so it renders neutral instead.
+    if score is None or score == 0 or score == SCORE_NOT_ASSESSED:
         return NEUTRAL_COLOR
-        
+
     max_green, max_yellow = REGION_THRESHOLDS.get(region, (2, 4))
-    
+
     if score <= max_green:
-        return (0, 200, 0)      
+        return (0, 200, 0)
     elif score <= max_yellow:
-        return (0, 220, 255)    
+        return (0, 220, 255)
     else:
-        return (0, 0, 255)      
+        return (0, 0, 255)
+
+
+def fmt_score(score):
+    """Render a score field for the overlay, or 'n/a' when never measured."""
+    if score is None or score == SCORE_NOT_ASSESSED:
+        return "n/a"
+    return str(int(score))
 
 def is_valid(pt):
     if any(np.isnan(v) for v in pt):
@@ -253,28 +265,45 @@ class SkeletonOverlayNode(Node):
         # NEW DASHBOARD TEXT OVERLAY WITH SCORE A, B, AND ACTIVITY
         # ---------------------------------------------------------
         if assessment is not None:
-            # Safely clamp indices to avoid out-of-bounds error
-            safe_a = min(12, max(1, assessment.score_a))
-            safe_b = min(12, max(1, assessment.score_b))
-            
-            # Reverse engineer the activity score
-            raw_table_c_score = TABLE_C[safe_a - 1][safe_b - 1]
-            activity_score = assessment.score_c - raw_table_c_score
+            scored = assessment.score_c != SCORE_NOT_ASSESSED
 
-            # Main Header
-            cv2.putText(frame, f"FINAL REBA: {assessment.score_c}/15 | Risk: {assessment.risk_level}", 
-                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-            
-            # Breakdown Sub-Headers
-            cv2.putText(frame, f"Score A (Body + Load) : {assessment.score_a}", 
+            if scored:
+                header_txt = f"FINAL REBA: {assessment.score_c}/15 | Risk: {assessment.risk_level}"
+                if assessment.score_is_lower_bound:
+                    header_txt += " (min)"
+                header_color = (255, 255, 255)
+            else:
+                # No final score exists for this frame. Showing a number here
+                # would invent one out of missing joints.
+                header_txt = "FINAL REBA: n/a - incomplete skeleton"
+                header_color = (0, 220, 255)
+
+            cv2.putText(frame, header_txt,
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, header_color, 2, cv2.LINE_AA)
+
+            cv2.putText(frame, f"Score A (Body + Load) : {fmt_score(assessment.score_a)}",
                         (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
-            cv2.putText(frame, f"Score B (Arm + Coupl) : {assessment.score_b}", 
+            cv2.putText(frame, f"Score B (Arm + Coupl) : {fmt_score(assessment.score_b)}",
                         (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
-            
-            # Activity Penalty with dynamic color (Green if 0, Orange if > 0)
-            act_color = (0, 200, 0) if activity_score == 0 else (0, 165, 255)
-            cv2.putText(frame, f"Activity Penalty      : +{activity_score}", 
+
+            # Activity penalty is recovered from Table C only when both group
+            # scores and the final score are real numbers.
+            if scored and assessment.group_a_valid and assessment.group_b_valid:
+                safe_a = min(12, max(1, assessment.score_a))
+                safe_b = min(12, max(1, assessment.score_b))
+                activity_score = assessment.score_c - TABLE_C[safe_a - 1][safe_b - 1]
+                act_color = (0, 200, 0) if activity_score == 0 else (0, 165, 255)
+                act_txt = f"Activity Penalty      : +{activity_score}"
+            else:
+                act_color = NEUTRAL_COLOR
+                act_txt = "Activity Penalty      : n/a"
+            cv2.putText(frame, act_txt,
                         (20, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.55, act_color, 1, cv2.LINE_AA)
+
+            deba_txt = (f"DEBA                  : {assessment.deba_score:.2f}"
+                        if assessment.deba_valid else "DEBA                  : n/a")
+            cv2.putText(frame, deba_txt,
+                        (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
         else:
             cv2.putText(frame, "REBA: waiting for assessment...", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
 
@@ -288,9 +317,9 @@ class SkeletonOverlayNode(Node):
             ("Wrist", wrist_s, color_wrist),
         ]
         
-        y = 175 # Lowered starting position
+        y = 200 # Lowered starting position (DEBA line added above)
         for name, score, color in region_lines:
-            cv2.putText(frame, f"{name:<10}: {score}", (20, y),
+            cv2.putText(frame, f"{name:<10}: {fmt_score(score)}", (20, y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
             y += 25
 

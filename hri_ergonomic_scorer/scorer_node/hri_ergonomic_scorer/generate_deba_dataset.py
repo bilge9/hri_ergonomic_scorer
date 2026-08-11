@@ -1,6 +1,7 @@
 import argparse
 import csv
 import random
+from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -25,9 +26,25 @@ CONTINUOUS_RANGES = {
     "wrist_angle": (-45.0, 45.0),
 }
 
+# Narrow bands around a neutral standing posture. Plain Latin Hypercube over
+# CONTINUOUS_RANGES practically never lands on the low-risk corner (all seven
+# variables neutral at once), so the teacher produced no REBA 1 labels at all
+# and the student could not represent "negligible risk". A fraction of every
+# batch is drawn from here instead.
+NEUTRAL_RANGES = {
+    "neck_angle": (-5.0, 20.0),
+    "trunk_angle": (0.0, 20.0),
+    "legs_angle": (0.0, 30.0),
+    "load_kg": (0.0, 5.0),
+    "upper_arm_angle": (-20.0, 20.0),
+    "lower_arm_angle": (60.0, 100.0),
+    "wrist_angle": (-15.0, 15.0),
+}
+NEUTRAL_FLAG_PROB = 0.1
+
 BINARY_FIELDS = [
-    "neck_side", "trunk_side", "legs_walking", "shoulder_raised",
-    "arm_abducted", "leaning", "wrist_twisted", 
+    "neck_side", "trunk_side", "legs_unstable", "shoulder_raised",
+    "arm_abducted", "leaning", "wrist_twisted",
     "activity_static", "activity_repeated", "activity_rapid_change"
 ]
 
@@ -50,7 +67,7 @@ class RebaFeatureSample:
     wrist_angle: float
     neck_side: int
     trunk_side: int
-    legs_walking: int
+    legs_unstable: int
     shoulder_raised: int
     arm_abducted: int
     leaning: int
@@ -97,7 +114,32 @@ def sample_dataset_lhs(n_samples: int, seed: int = 42, include_wrist: bool = Tru
             values[name] = opts[opt_idx]
             
         samples.append(RebaFeatureSample(**values))
-        
+
+    return samples
+
+
+def sample_neutral(n_samples: int, seed: int = 42, include_wrist: bool = True) -> list:
+    """
+    Draw postures from the low-risk corner of the feature space, which uniform
+    LHS over the full ranges misses almost entirely.
+    """
+    rng = random.Random(seed + 1)
+    samples = []
+    for _ in range(n_samples):
+        values = {}
+        for name, (lo, hi) in NEUTRAL_RANGES.items():
+            if name == "wrist_angle" and not include_wrist:
+                values[name] = 0.0
+            else:
+                values[name] = rng.uniform(lo, hi)
+        for name in BINARY_FIELDS:
+            if name == "wrist_twisted" and not include_wrist:
+                values[name] = 0
+            else:
+                values[name] = 1 if rng.random() < NEUTRAL_FLAG_PROB else 0
+        for name, opts in CATEGORICAL_FIELDS.items():
+            values[name] = opts[0] if rng.random() > NEUTRAL_FLAG_PROB else rng.choice(opts)
+        samples.append(RebaFeatureSample(**values))
     return samples
 
 
@@ -105,7 +147,7 @@ def compute_reba_label(sample: RebaFeatureSample) -> dict:
     reba = RebaScore()
     body_values = [
         sample.neck_angle, sample.neck_side, sample.trunk_angle,
-        sample.trunk_side, sample.legs_walking, sample.legs_angle, sample.load_kg
+        sample.trunk_side, sample.legs_unstable, sample.legs_angle, sample.load_kg
     ]
     # Argümanların liste olarak mı yoksa tek tek mi beklendiğine dair güvenli yapı:
     try:
@@ -157,6 +199,19 @@ def inject_noise(sample: RebaFeatureSample, include_wrist: bool) -> RebaFeatureS
 
 
 def balance_by_label(samples: list, labels: list, target_per_bin: int, seed: int = 42, include_wrist: bool = True):
+    """
+    Even out the label histogram by oversampling rare score bins.
+
+    Every oversampled row is RE-LABELLED after noise injection. Copying the
+    base sample's label instead corrupted 14.5% of the previous dataset: REBA
+    is a step function, so a 2% perturbation routinely crosses a category
+    boundary and the stored label no longer describes the stored features.
+    That put a hard ceiling of ~85% on any student model's rounded agreement.
+
+    Because relabelling can move a row into a different bin, the resulting
+    histogram is approximately, not exactly, flat. That is the correct
+    trade-off: a truthful label matters more than an exact bin count.
+    """
     rng = random.Random(seed)
     bins: dict = {}
     for idx, label in enumerate(labels):
@@ -171,14 +226,11 @@ def balance_by_label(samples: list, labels: list, target_per_bin: int, seed: int
                 balanced_samples.append(samples[i])
                 balanced_labels.append(labels[i])
         else:
-            # Oversampling ile gürültü enjeksiyonu
             for _ in range(target_per_bin):
                 i = rng.choice(idx_list)
-                base_sample = samples[i]
-                
-                noisy_sample = inject_noise(base_sample, include_wrist)
+                noisy_sample = inject_noise(samples[i], include_wrist)
                 balanced_samples.append(noisy_sample)
-                balanced_labels.append(labels[i])
+                balanced_labels.append(compute_reba_label(noisy_sample))
 
     return balanced_samples, balanced_labels
 
@@ -222,6 +274,8 @@ def main():
     parser.add_argument("--n-raw-samples", type=int, default=300_000)
     parser.add_argument("--target-per-bin", type=int, default=8_000)
     parser.add_argument("--val-ratio", type=float, default=0.15)
+    parser.add_argument("--neutral-fraction", type=float, default=0.1,
+                        help="Share of raw samples drawn from the neutral/low-risk band")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out-dir", type=str, default="./deba_dataset")
     parser.add_argument("--exclude-wrist", action="store_true")
@@ -234,25 +288,54 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     include_wrist = not args.exclude_wrist
 
-    print(f"[1/4] {args.n_raw_samples} ham örnek üretiliyor (LHS ile)...")
-    raw_samples = sample_dataset_lhs(args.n_raw_samples, args.seed, include_wrist)
+    n_neutral = int(args.n_raw_samples * args.neutral_fraction)
+    n_lhs = args.n_raw_samples - n_neutral
 
-    print("[2/4] Örnekler etiketleniyor...")
+    print(f"[1/5] {n_lhs} LHS + {n_neutral} neutral-band ham örnek üretiliyor...")
+    raw_samples = sample_dataset_lhs(n_lhs, args.seed, include_wrist)
+    raw_samples += sample_neutral(n_neutral, args.seed, include_wrist)
+
+    print("[2/5] Örnekler etiketleniyor...")
     raw_labels = [compute_reba_label(s) for s in raw_samples]
 
-    print(f"[3/4] Dataset dengeleniyor (bin başına hedef: {args.target_per_bin})...")
-    balanced_samples, balanced_labels = balance_by_label(
-        raw_samples, raw_labels, args.target_per_bin, args.seed, include_wrist
+    # ORDER MATTERS. Splitting AFTER balancing leaked the validation set: an
+    # oversampled row and its 2%-noise siblings landed on both sides of the
+    # split, so ~48% of validation rows had a near-duplicate in training with
+    # an identical label. The model memorised those copies and the reported
+    # validation MSE dropped below the dataset's own label-noise floor.
+    # Splitting the RAW pool first keeps the held-out set genuinely unseen.
+    print(f"[3/5] Ham havuz train/val olarak ayrılıyor (val oranı: {args.val_ratio})...")
+    train_raw_s, train_raw_l, val_s, val_l = train_val_split(
+        raw_samples, raw_labels, args.val_ratio, args.seed
     )
 
-    train_s, train_l, val_s, val_l = train_val_split(balanced_samples, balanced_labels, args.val_ratio, args.seed)
+    # Balancing is a TRAINING-side technique only. The validation set keeps the
+    # teacher's natural label distribution so the reported score describes
+    # generalisation rather than a re-weighted artefact.
+    print(f"[4/5] Sadece train tarafı dengeleniyor (bin başına hedef: {args.target_per_bin})...")
+    train_s, train_l = balance_by_label(
+        train_raw_s, train_raw_l, args.target_per_bin, args.seed, include_wrist
+    )
+    rng = random.Random(args.seed)
+    combined = list(zip(train_s, train_l))
+    rng.shuffle(combined)
+    train_s = [c[0] for c in combined]
+    train_l = [c[1] for c in combined]
 
-    print(f"[4/4] Diske yazılıyor -> {out_dir}")
+    print(f"[5/5] Diske yazılıyor -> {out_dir}")
     write_csv(out_dir / "deba_train.csv", train_s, train_l)
     write_csv(out_dir / "deba_val.csv", val_s, val_l)
     write_npz(out_dir / "deba_train.npz", train_s, train_l)
     write_npz(out_dir / "deba_val.npz", val_s, val_l)
-    print(f"Tamamlandı. Train: {len(train_s)}, Val: {len(val_s)}")
+
+    train_hist = Counter(l["final_reba_score"] for l in train_l)
+    val_hist = Counter(l["final_reba_score"] for l in val_l)
+    print(f"\nTamamlandı. Train: {len(train_s)}, Val: {len(val_s)}")
+    print(f"  train label histogram: {dict(sorted(train_hist.items()))}")
+    print(f"  val   label histogram: {dict(sorted(val_hist.items()))}")
+    print("  NOTE: the val set is deliberately UNBALANCED - it is the held-out "
+          "distribution, not a re-weighted one. Report per-class metrics on it, "
+          "not just overall accuracy.")
 
 if __name__ == "__main__":
     main()
