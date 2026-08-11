@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# ROS 2 / colcon
+build/
+install/
+log/
+
+# Training artefacts. Both are reproducible from the scripts in the package
+# and MUST be regenerated whenever reba.py changes, since reba.py is the
+# teacher that labels the dataset. Committing them invites a stale model
+# scoring postures with rules the code no longer uses.
+#   python3 generate_deba_dataset.py
+#   python3 train_deba_model.py
+deba_dataset/
+*.pth
+*.npz

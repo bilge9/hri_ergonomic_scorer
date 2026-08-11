@@ -1,0 +1,91 @@
+version: "3.8"
+
+services:
+  mongo-db:
+    image: mongo:4.4
+    hostname: mongo-db
+    container_name: db-mongo
+    expose:
+      - "27017"
+    ports:
+      - "27017:27017" 
+    networks:
+      - fiware-net
+    command: --nojournal
+    volumes:
+      - mongo-db:/data/db
+
+  # Orion is the context broker
+  orion:
+    image: fiware/orion-ld:latest
+    hostname: orion-ld
+    container_name: fiware-orion-ld
+    depends_on:
+      - mongo-db
+      - timescaledb
+    networks:
+      - fiware-net
+    expose:
+      - "1026"
+    ports:
+      - "1026:1026" 
+    #orion speaks to timescaledb directly
+    command: -dbhost mongo-db -logLevel DEBUG -troe -troeHost timescaledb -troePort 5432 -troeUser orion -troePwd orion
+    healthcheck:
+      test: curl --fail -s http://orion-ld:1026/version || exit 1
+
+  timescaledb:
+    image: timescale/timescaledb-postgis:latest-pg12
+    hostname: timescaledb
+    container_name: db-timescale
+    environment:
+      - POSTGRES_USER=orion
+      - POSTGRES_PASSWORD=orion
+      - POSTGRES_DB=orion
+    networks:
+      - fiware-net
+    expose:
+      - "5432"
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale-data:/var/lib/postgresql/data
+
+  # mintaka:
+  #   image: fiware/mintaka:latest
+  #   hostname: mintaka
+  #   container_name: fiware-mintaka
+  #   depends_on:
+  #     - timescaledb
+  #   environment:
+  #     - DATASOURCES_DEFAULT_HOST=timescaledb
+  #     - DATASOURCES_DEFAULT_USERNAME=mintaka
+  #     - DATASOURCES_DEFAULT_PASSWORD=mintaka
+  #     - DATASOURCES_DEFAULT_DATABASE=mintaka
+  #   networks:
+  #     - fiware-net
+  #   expose:
+  #     - "8080"
+  #   ports:
+  #     - "8080:8080"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    depends_on:
+      - timescaledb
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_PANELS_DISABLE_SANITIZE_HTML=true
+    networks:
+      - fiware-net
+
+networks:
+  fiware-net:
+    driver: bridge
+
+volumes:
+  mongo-db:
+  timescale-data:
