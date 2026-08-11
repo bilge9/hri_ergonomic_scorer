@@ -56,24 +56,40 @@ def reba_inputs_are_sufficient(reba_valid: np.ndarray) -> dict:
     5: R_Shoulder, 6: R_Elbow, 7: R_Wrist, 8: L_Hip, 9: L_Knee, 10: L_Ankle
     11: R_Hip, 12: R_Knee, 13: R_Ankle
     """
-    mid_hip_ok = reba_valid[8] and reba_valid[11]
-    shoulder_axis_ok = reba_valid[2] and reba_valid[5]
+    # A worker seen side-on loses one hip and one shoulder. Demanding both
+    # would declare the trunk unmeasurable on the most common construction
+    # posture, and the scorer would then substitute an upright trunk for
+    # someone who may be bent double. One hip still fixes the trunk axis and
+    # one shoulder still fixes the lateral direction via the neck, so the
+    # single-sided cases count as usable. reba.py builds the matching
+    # fallback frame and suppresses the lateral terms, which genuinely do
+    # need both sides.
+    any_hip_ok = reba_valid[8] or reba_valid[11]
+    any_shoulder_ok = reba_valid[2] or reba_valid[5]
 
-    trunk_ok = reba_valid[1] and mid_hip_ok
-    neck_ok = reba_valid[0] and reba_valid[1] and mid_hip_ok and shoulder_axis_ok
+    # Kept for consumers that need to know the frame was fully supported.
+    mid_hip_exact = reba_valid[8] and reba_valid[11]
+    shoulder_axis_exact = reba_valid[2] and reba_valid[5]
+
+    trunk_ok = reba_valid[1] and any_hip_ok
+    neck_ok = reba_valid[0] and reba_valid[1] and any_hip_ok and any_shoulder_ok
 
     left_leg_ok = reba_valid[8] and reba_valid[9] and reba_valid[10]
     right_leg_ok = reba_valid[11] and reba_valid[12] and reba_valid[13]
 
-    left_upper_arm_ok = reba_valid[2] and reba_valid[3] and shoulder_axis_ok
+    # The upper arm is scored against the trunk axis, so it needs a trunk
+    # reference rather than the full shoulder line.
+    left_upper_arm_ok = reba_valid[2] and reba_valid[3] and reba_valid[1] and any_hip_ok
     left_lower_arm_ok = reba_valid[3] and reba_valid[4] and reba_valid[2]
-    
-    right_upper_arm_ok = reba_valid[5] and reba_valid[6] and shoulder_axis_ok
+
+    right_upper_arm_ok = reba_valid[5] and reba_valid[6] and reba_valid[1] and any_hip_ok
     right_lower_arm_ok = reba_valid[6] and reba_valid[7] and reba_valid[5]
 
     return {
         "trunk_ok": trunk_ok,
         "neck_ok": neck_ok,
+        "mid_hip_exact": mid_hip_exact,
+        "shoulder_axis_exact": shoulder_axis_exact,
         "left_leg_ok": left_leg_ok,
         "right_leg_ok": right_leg_ok,
         "left_upper_arm_ok": left_upper_arm_ok,

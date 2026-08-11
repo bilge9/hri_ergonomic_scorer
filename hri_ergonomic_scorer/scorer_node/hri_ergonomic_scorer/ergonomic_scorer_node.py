@@ -372,8 +372,10 @@ class ErgonomicScorerNode(Node):
             body_angles = np.zeros(7)
             leg_side = "Unknown"
 
-            calc_angles_r = reba.get_body_angles_from_pose_right(reba_pose)
-            calc_angles_l = reba.get_body_angles_from_pose_left(reba_pose)
+            # reba_valid lets the geometry fall back to a single hip / single
+            # shoulder instead of silently averaging in zero-filled joints.
+            calc_angles_r = reba.get_body_angles_from_pose_right(reba_pose, valid=reba_valid)
+            calc_angles_l = reba.get_body_angles_from_pose_left(reba_pose, valid=reba_valid)
 
             neck_assessed = bool(readiness["neck_ok"])
             trunk_assessed = bool(readiness["trunk_ok"])
@@ -448,8 +450,8 @@ class ErgonomicScorerNode(Node):
             # ==========================================================
             # GROUP B (ARMS) - bilateral, highest risk side wins
             # ==========================================================
-            calc_arm_r = reba.get_arms_angles_from_pose_right(reba_pose)
-            calc_arm_l = reba.get_arms_angles_from_pose_left(reba_pose)
+            calc_arm_r = reba.get_arms_angles_from_pose_right(reba_pose, valid=reba_valid)
+            calc_arm_l = reba.get_arms_angles_from_pose_left(reba_pose, valid=reba_valid)
 
             score_b_r, partial_b_r = 0, [0, 0, 0, 0]
             score_b_l, partial_b_l = 0, [0, 0, 0, 0]

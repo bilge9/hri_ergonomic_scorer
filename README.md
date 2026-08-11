@@ -82,6 +82,21 @@ fully occluded worker read as "REBA 1 / Negligible Risk". So:
 parameters default to `false`, so out of the box the final score is always a
 lower bound.
 
+### Degraded, not refused
+
+Occlusion is graded rather than binary. A worker seen side-on loses one hip and
+one shoulder, which is the most common construction posture; refusing to score
+it would mean substituting an upright trunk for someone who may be bent double.
+So a single hip is enough to fix the trunk axis, and a single shoulder is enough
+to fix the lateral direction via the neck.
+
+The terms that genuinely need both sides — trunk side bend, neck side bend,
+`shoulder_raised` — are suppressed on a one-sided frame rather than guessed,
+because a single hip displaces the trunk base by half a pelvis width and
+fabricates roughly 10° of lean. `reba_inputs_are_sufficient()` reports
+`mid_hip_exact` / `shoulder_axis_exact` so a consumer can tell a fully
+supported frame from a degraded one.
+
 ## DEBA
 
 DEBA is a continuous, differentiable surrogate for REBA. REBA stays the
@@ -115,6 +130,29 @@ Two properties of the pipeline are load-bearing and easy to break:
 The validation set is deliberately left unbalanced — it is the held-out
 distribution. Report the per-class agreement the training script prints, not
 only the overall figure.
+
+### Reference results
+
+Produced by the two commands above with default settings (300k raw samples,
+120k balanced training rows, 45k held-out rows, 60 epochs, CPU, ~2.5 min):
+
+| Metric | Value |
+| --- | --- |
+| Rounded agreement (exact) | 71.2% |
+| Within ±1 | 99.2% |
+| 5-class risk-level agreement | 93.4% |
+| MAE | 0.379 |
+| Val MSE | 0.248 (mean-predictor baseline 11.35) |
+| Directional bias | −0.035 |
+
+Agreement is weakest in the REBA 5–8 band (43–54%), the medium-risk transition
+zone, and strongest at both extremes. Quote the 5-class figure for the risk
+dashboard and the exact figure for score-level claims — they answer different
+questions.
+
+These numbers describe how well DEBA reproduces REBA. **They are not the
+accuracy of the ergonomic assessment itself**, which requires expert-annotated
+ground truth and has not been measured.
 
 ## Tests
 
