@@ -14,10 +14,24 @@ from hri_ergonomic_msgs.msg import RebaAssessment, RebaAssessmentList
 
 from .reba import RebaScore, SCORE_NOT_ASSESSED
 from .pose_remap import remap_pose_to_reba, reba_inputs_are_sufficient, remap_scalar_to_reba, reba_region_confidence
-from .deba_model_def import load_checkpoint
 
 import os
-import torch
+
+# PyTorch backs the DEBA companion score only; REBA is pure numpy. Importing it
+# at module scope made it a hard dependency of the whole node, so a workspace
+# without torch - or one built against a different interpreter than the venv
+# holding it - could not start the scorer at all. DEBA is secondary by design,
+# so a missing torch disables that one field instead of the node.
+try:
+    import torch
+    from .deba_model_def import load_checkpoint
+    TORCH_AVAILABLE = True
+    TORCH_IMPORT_ERROR = None
+except ImportError as exc:
+    torch = None
+    load_checkpoint = None
+    TORCH_AVAILABLE = False
+    TORCH_IMPORT_ERROR = exc
 
 TOTAL_JOINTS = 18
 
@@ -197,31 +211,38 @@ class ErgonomicScorerNode(Node):
 
         self.get_logger().info(f"Parameter changed. Threshold: {self.threshold}")
         self.get_logger().info("Ergonomic Scorer Node started. Granular partial REBA enabled.")
-        self.device = torch.device("cpu")  # inference only, CPU is plenty
+        self.device = torch.device("cpu") if TORCH_AVAILABLE else None
         self.deba_model = None
         self.deba_ready = False
 
         package_share_directory = get_package_share_directory('hri_ergonomic_scorer')
         model_path = os.path.join(package_share_directory, 'models', 'deba_model.pth')
 
-        try:
-            model, feature_names = load_checkpoint(model_path, map_location=self.device)
-            if feature_names and list(feature_names) != DEBA_FEATURE_ORDER:
-                raise ValueError(
-                    f"DEBA checkpoint feature order does not match the node.\n"
-                    f"  checkpoint: {list(feature_names)}\n"
-                    f"  node      : {DEBA_FEATURE_ORDER}"
-                )
-            self.deba_model = model.to(self.device)
-            self.deba_ready = True
-            self.get_logger().info(f"DEBA PyTorch model loaded: {model_path}")
-        except Exception as e:
-            # DEBA stays off rather than publishing numbers from a randomly
-            # initialised or mismatched network. REBA is unaffected.
-            self.get_logger().error(
-                f"DEBA model could not be loaded - DEBA output DISABLED, REBA "
-                f"continues normally. Regenerate the dataset and retrain with "
-                f"train_deba_model.py. Error: {e}")
+        if not TORCH_AVAILABLE:
+            self.get_logger().warn(
+                f"PyTorch is not importable in this interpreter - DEBA output "
+                f"DISABLED, REBA continues normally. Install torch into the "
+                f"environment this node is built against, then rebuild. "
+                f"({TORCH_IMPORT_ERROR})")
+        else:
+            try:
+                model, feature_names = load_checkpoint(model_path, map_location=self.device)
+                if feature_names and list(feature_names) != DEBA_FEATURE_ORDER:
+                    raise ValueError(
+                        f"DEBA checkpoint feature order does not match the node.\n"
+                        f"  checkpoint: {list(feature_names)}\n"
+                        f"  node      : {DEBA_FEATURE_ORDER}"
+                    )
+                self.deba_model = model.to(self.device)
+                self.deba_ready = True
+                self.get_logger().info(f"DEBA PyTorch model loaded: {model_path}")
+            except Exception as e:
+                # DEBA stays off rather than publishing numbers from a randomly
+                # initialised or mismatched network. REBA is unaffected.
+                self.get_logger().error(
+                    f"DEBA model could not be loaded - DEBA output DISABLED, REBA "
+                    f"continues normally. Regenerate the dataset and retrain with "
+                    f"train_deba_model.py. Error: {e}")
 
         self.skel_queue = queue.Queue(maxsize=5)
 

@@ -116,7 +116,21 @@ python3 train_deba_model.py               # writes deba_model.pth
 ```
 
 Without a checkpoint the node logs an error, disables DEBA and continues
-publishing REBA normally.
+publishing REBA normally. **PyTorch itself is optional** for the same reason —
+if `import torch` fails, the node warns, disables DEBA and still publishes
+REBA, which is pure numpy.
+
+If DEBA stays disabled while torch *is* installed, check which interpreter the
+installed entry point actually uses — colcon bakes the build-time interpreter
+into the script's shebang, so a package built outside a virtualenv will not see
+packages installed inside it:
+
+```bash
+head -1 install/hri_ergonomic_scorer/lib/hri_ergonomic_scorer/scorer_node
+```
+
+Build from the same environment that holds torch, or install torch where that
+interpreter can see it.
 
 Two properties of the pipeline are load-bearing and easy to break:
 
