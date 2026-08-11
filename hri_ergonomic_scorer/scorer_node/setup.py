@@ -40,6 +40,7 @@ setup(
             'scorer_node = hri_ergonomic_scorer.ergonomic_scorer_node:main',
             'fiware_reba_bridge = hri_ergonomic_scorer.fiware_reba_bridge:main',
             'skeleton_overlay = hri_ergonomic_scorer.skeleton_overlay_node:main',
+            'annotation_recorder = hri_ergonomic_scorer.annotation_recorder:main',
         ],
     },
 )
